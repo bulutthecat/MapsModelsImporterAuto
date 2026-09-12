@@ -560,9 +560,9 @@ print("  ok  module version: %s" % rd.GetVersionString())
         if [ "$browser" = "$BUNDLED_BROWSER" ]; then
             good "$browser (downloaded by install-chromium)"
         else
-            good "$browser"
-            info "For a setup that does not depend on the distribution's packaging,"
-            info "run '$0 install-chromium'."
+            warn "$browser is a distribution build; 'up' will download and use"
+            warn "its own Chrome instead unless you set MMI_BROWSER."
+            warnings=$((warnings + 1))
         fi
     else
         bad "No usable browser found"
@@ -750,6 +750,19 @@ browser_arguments() {
         "--disable-gpu-watchdog" \
         "--ozone-platform=x11"
 
+    # Use the GPU, full stop. Chromium is quick to give up on it: a blocklisted
+    # driver, or the GPU process crashing three times, and it quietly switches
+    # to software rendering for the rest of the session -- at which point
+    # WebGL runs in SwiftShader, which RenderDoc cannot see, and every capture
+    # comes back with nothing 3D in it. None of those fallbacks is useful to
+    # us, so turn them all off: a session where the GPU does not work should
+    # fail visibly rather than degrade.
+    printf '%s\n' \
+        "--ignore-gpu-blocklist" \
+        "--disable-gpu-process-crash-limit" \
+        "--disable-software-rasterizer" \
+        "--enable-gpu-rasterization"
+
     # Last resort: run the GPU code inside the browser process itself, so that
     # the process RenderDoc launched directly is the one issuing the draw
     # calls and no child has to be hooked at all.
@@ -834,7 +847,20 @@ cmd_launch() {
 
     local python
     python="$(require_python)"
-    [ -n "$browser" ] || browser="$(find_browser)" || die "No usable browser found (see: $0 doctor)"
+    if [ -z "$browser" ] && [ -z "$MMI_BROWSER" ]; then
+        # The browser we download is the only one we have seen survive with
+        # RenderDoc inside its GPU process. Falling back to whatever the
+        # distribution ships turned a working setup into one whose GPU process
+        # crashed three times and was then switched off by Chromium itself,
+        # so: no silent fallback. --browser or MMI_BROWSER still override.
+        if [ ! -x "$BUNDLED_BROWSER" ]; then
+            info "No bundled Chrome yet, downloading one"
+            cmd_install_chromium
+        fi
+        browser="$BUNDLED_BROWSER"
+    fi
+    [ -n "$browser" ] || browser="$(resolve_browser_binary "$MMI_BROWSER")"
+    [ -x "$browser" ] || die "Browser is not executable: $browser"
 
     mkdir -p "$CAPTURE_DIR" "$OUTPUT_DIR" "$RUN_DIR" "$BROWSER_PROFILE"
 
@@ -890,7 +916,13 @@ cmd_launch() {
         hook_children=(--no-hook-children)
     fi
 
-    info "Browser: $browser"
+    local version
+    version="$("$browser" --version 2>/dev/null | head -n 1 || true)"
+    info "Browser: $browser${version:+ ($version)}"
+    if [ "$browser" != "$BUNDLED_BROWSER" ]; then
+        warn "This is not the Chrome that 'install-chromium' provides. Distribution"
+        warn "builds have been seen to crash their GPU process under RenderDoc."
+    fi
     info "API mode: $api"
     info "Captures go to $CAPTURE_DIR"
 

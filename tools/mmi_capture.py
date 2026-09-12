@@ -179,6 +179,10 @@ class TargetSet:
         self.controls = {}
         self.apis = {}
         self.saw_graphics_api = False
+        # Times a process that had a live graphics API went away. That is the
+        # GPU process crashing, and Chromium's answer to a few of those is to
+        # stop using the GPU -- which makes every later capture worthless.
+        self.gpu_process_losses = 0
         # Idents we failed to connect to, and when. RenderDoc reuses idents as
         # processes come and go, so a refusal has to expire or we would end up
         # ignoring the very process we are waiting for.
@@ -230,6 +234,20 @@ class TargetSet:
                 pass
         self.controls.clear()
 
+    def forget(self, ident, control):
+        api = self.apis.pop(ident, None)
+        if api:
+            self.gpu_process_losses += 1
+            log(f"The {api} process (target {ident:#x}) went away -- the GPU process crashed"
+                f" ({self.gpu_process_losses} so far)")
+            if self.gpu_process_losses == 1:
+                log("  If this keeps happening the browser is not usable under RenderDoc;")
+                log("  make sure you are running the Chrome from `mmi install-chromium`.")
+        else:
+            log(f"Target {ident:#x} disconnected")
+        control.Shutdown()
+        del self.controls[ident]
+
     def graphicsTargets(self):
         """Connections whose process has initialised a graphics API, i.e. the
         ones a capture can actually be triggered on."""
@@ -249,9 +267,7 @@ class TargetSet:
         for ident in list(self.controls):
             control = self.controls[ident]
             if not control.Connected():
-                log(f"Target {ident:#x} disconnected")
-                control.Shutdown()
-                del self.controls[ident]
+                self.forget(ident, control)
                 continue
 
             msg = control.ReceiveMessage(None)
@@ -260,9 +276,7 @@ class TargetSet:
             if msg_type == rd.TargetControlMessageType.Noop:
                 continue
             if msg_type == rd.TargetControlMessageType.Disconnected:
-                log(f"Target {ident:#x} disconnected")
-                control.Shutdown()
-                del self.controls[ident]
+                self.forget(ident, control)
             elif msg_type == rd.TargetControlMessageType.NewChild:
                 child = msg.newChild
                 log(f"Browser spawned child process {child.processId}")

@@ -44,13 +44,14 @@ Requirements
 * A GPU with working hardware acceleration, and an X11 session (on Wayland the
   browser is started through XWayland, which is the combination RenderDoc
   supports).
-* A browser. `tools/mmi install-chromium` downloads a self-contained Chrome
-  (Google's "Chrome for Testing" build) into `~/.local/share/maps-models-importer`,
-  which needs no root and behaves the same on every distribution. `mmi setup`
-  does this automatically when it cannot find a usable browser.
-
-  A distribution browser works too, as long as it is **not** a snap or flatpak
-  package: their confinement prevents RenderDoc from hooking the process.
+* A browser -- and `mmi` brings its own. `up` uses the self-contained Chrome
+  that `tools/mmi install-chromium` downloads (Google's "Chrome for Testing"
+  build, no root needed), fetching it first if it is missing. It never falls
+  back to the distribution's browser on its own: Ubuntu's Chromium build has
+  been seen to crash its GPU process under RenderDoc, after which Chromium
+  switches to software rendering and captures contain no 3D. To use another
+  browser anyway, set `MMI_BROWSER` or pass `--browser` (not a snap or
+  flatpak: their confinement prevents the hooking).
 
 Commands
 --------
@@ -167,6 +168,18 @@ namespace. RenderDoc's child-process hooking breaks that handshake and the
 browser aborts. `mmi` therefore passes `--no-zygote` (and `--no-sandbox`, which
 Chromium requires alongside it), so children are forked and exec'd directly.
 If you are launching the browser by hand, you need both of those flags.
+
+**`chrome://gpu` says "GPU process was unable to boot: GPU access is disabled
+due to frequent crashes", everything is "Software only", and the session log
+shows "the GPU process crashed".** The GPU process died three times and
+Chromium gave up on the GPU for the rest of the session, so WebGL now runs in
+SwiftShader, which RenderDoc cannot see. Two things were done about this:
+`mmi` passes `--disable-gpu-process-crash-limit`, `--ignore-gpu-blocklist` and
+`--disable-software-rasterizer`, so the GPU is used or the page fails visibly
+rather than quietly degrading; and it insists on its own Chrome build, the
+only one seen to survive with RenderDoc in its GPU process. If the crashes
+persist with that build, the session log counts them; that is the information
+to report.
 
 **A browser from a previous session is still running.** `mmi` tells you the
 pid and refuses to start, because a second instance on the same profile would
