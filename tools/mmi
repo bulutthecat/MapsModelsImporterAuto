@@ -428,7 +428,7 @@ OUTPUT_DIR="$OUTPUT_DIR"
 CHROME_VERSION="$CHROME_VERSION"
 # MMI_BROWSER="/usr/bin/google-chrome-stable"
 # MMI_BLENDER="/opt/blender/blender"
-# MMI_API="gl"          # gl, gl-egl or vulkan
+# MMI_API="gl"          # gl, gl-egl, gles or vulkan
 # MMI_URL="https://earth.google.com/web/"
 EOF
     good "Configuration written to $MMI_CONFIG"
@@ -775,11 +775,18 @@ browser_arguments() {
             # Force ANGLE onto desktop GL, which is what RenderDoc hooks.
             printf '%s\n' "--use-angle=gl" "--disable-features=Vulkan"
             ;;
+        gles)
+            # ANGLE on the driver's OpenGL ES instead. RenderDoc captures
+            # that too, through EGL, and keeps its own copy of every
+            # compressed texture upload on ES -- a way around a driver whose
+            # desktop GL path leaves the tile textures empty in the capture.
+            printf '%s\n' "--use-angle=gles" "--disable-features=Vulkan"
+            ;;
         vulkan)
             printf '%s\n' "--use-angle=vulkan" "--enable-features=Vulkan"
             ;;
         *)
-            die "Unknown API '$api' (expected gl, gl-egl or vulkan)"
+            die "Unknown API '$api' (expected gl, gl-egl, gles or vulkan)"
             ;;
     esac
 }
@@ -792,7 +799,7 @@ browser_environment() {
             # that it hooks the GLX calls ANGLE makes underneath instead.
             printf '%s\n' "RENDERDOC_HOOK_EGL=0"
             ;;
-        gl-egl)
+        gl-egl|gles)
             printf '%s\n' "RENDERDOC_HOOK_EGL=1"
             ;;
     esac
@@ -1218,7 +1225,8 @@ Usage: $0 launch [options]
 
   --url URL                 Page to open (default: Google Maps over Paris)
   --earth                   Shorthand for Google Earth's URL
-  --api gl|gl-egl|vulkan    Which graphics API to capture (default $MMI_API)
+  --api gl|gl-egl|gles|vulkan
+                            Which graphics API to capture (default $MMI_API)
   --browser PATH            Browser to launch
   --auto-import             Import every capture into Blender as it is taken
   --glb                     Also export a .glb next to each .blend

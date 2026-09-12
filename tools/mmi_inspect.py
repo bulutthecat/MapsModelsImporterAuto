@@ -56,6 +56,7 @@ _REAL_ARGV = sys.argv
 sys.argv = [_REAL_ARGV[0], "", "", "-1"]
 
 import rdcompat
+import rdtexfile
 from rdcompat import Drawcall
 from rdutils import CaptureWrapper
 from google_maps_rd import CaptureScraper
@@ -158,7 +159,12 @@ def main(argv):
             return 2
 
         print(f"Grouping {len(indexed)} indexed draw calls by vertex shader...")
-        scraper = CaptureScraper(controller)
+        scraper = CaptureScraper(controller, args.capture)
+        file_textures = None
+        if args.textures:
+            file_textures = rdtexfile.CaptureFileTextures(args.capture)
+            if not file_textures.load(controller):
+                print(f"(could not read texture uploads from the capture file: {file_textures.error})")
         groups = {}
         for draw in indexed:
             shader, constants, attributes, textures = describe(controller, draw)
@@ -221,9 +227,22 @@ def main(argv):
                     nonzero = sum(1 for b in raw[:65536] if b)
                     print(f"    slot {position}: {desc.width}x{desc.height} {desc.format.Name()}"
                           f" {desc.type} mips={desc.mips} array={desc.arraysize};"
-                          f" raw data {len(raw)} bytes, {nonzero} of the first {min(len(raw), 65536)} non-zero")
-                    if nonzero == 0:
-                        print("      -> the capture holds no data for this texture at all")
+                          f" replay returns {len(raw)} bytes, {nonzero} of the first {min(len(raw), 65536)} non-zero")
+                    if file_textures is not None and file_textures.error is None:
+                        print(f"      capture file records: {file_textures.describe(rid)}")
+                        filed = file_textures.levelZero(rid, desc, entry["draws"][0].eventId)
+                        if filed is None:
+                            print("      -> no upload with data in the file either: never captured"
+                                  if nonzero == 0 else
+                                  "      (nothing usable in the file, but the replay has it)")
+                        elif nonzero == 0:
+                            print("      -> the replay lost it; the importer will take it from the file")
+                        elif bytes(raw) == filed:
+                            print("      (file and replay agree)")
+                        else:
+                            print("      (file and replay differ; the importer uses the replay)")
+                    elif nonzero == 0:
+                        print("      -> the replay holds no data for this texture at all")
 
             if args.source:
                 controller.SetFrameEvent(entry["draws"][0].eventId, False)
@@ -232,6 +251,9 @@ def main(argv):
                 print("  vertex shader source:")
                 print("    " + "\n    ".join(source.splitlines()) if source else "    (not available)")
             print()
+
+        if file_textures is not None:
+            file_textures.close()
 
     return 0
 

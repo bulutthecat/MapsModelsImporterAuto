@@ -59,6 +59,7 @@ except ImportError as err:
 
 import bcdecode
 import rdcompat
+import rdtexfile
 from rdcompat import Drawcall
 from meshdata import MeshData, makeMeshData
 from profiling import Timer, profiling_counters
@@ -79,6 +80,9 @@ CAPTURE_TYPE_UNIFORMS = {
 # ANGLE hashes the uniform names of WebGL shaders, which is why name matching
 # is hopeless for anything rendered by a browser.
 ANGLE_HASHED_NAME = re.compile(r"^_?webgl_[0-9a-f]{16}$")
+
+# What decodeTextureOurselves() returns when the texture is empty everywhere.
+BLANK = "blank"
 
 def isAngleWebglShader(names):
     return any(ANGLE_HASHED_NAME.match(name) for name in names)
@@ -118,8 +122,11 @@ def numpySave(array, file):
     array.tofile(file)
 
 class CaptureScraper():
-    def __init__(self, controller):
+    def __init__(self, controller, filename=None):
         self.controller = controller
+        # The capture file itself, for texture contents the replay does not
+        # hand back. Parsed on first need only.
+        self.file_textures = rdtexfile.CaptureFileTextures(filename) if filename else None
         self._uniform_names_cache = {}
         self._signature_cache = {}
         # Names the structural strategy worked out, handed to the importer so
@@ -127,7 +134,8 @@ class CaptureScraper():
         # transform when it cannot recognise them by name.
         self.uniform_hints = None
         self._textures = None
-        self.texture_report = {"saved": 0, "missing": 0, "blank": 0, "choices": set()}
+        self.texture_report = {"saved": 0, "missing": 0, "blank": 0, "choices": set(),
+                               "from_file": 0}
         self.capture_api = "unknown"
         # (events, draw calls, indexed draw calls) seen while scraping, used to
         # explain what went wrong when nothing relevant was found.
@@ -627,17 +635,25 @@ class CaptureScraper():
                 pickle.dump(constants, file)
 
             subtimer = Timer()
-            self.extractTexture(drawcallId, state)
+            self.extractTexture(drawcallId, state, draw.eventId)
             profiling_counters['extractTexture'].add_sample(subtimer)
 
             profiling_counters['processDrawEvent'].add_sample(timer)
 
         report = self.texture_report
         print(f"Textures: {report['saved']} saved, {report['blank']} blank, "
-              f"{report['missing']} draw calls without one")
+              f"{report['missing']} draw calls without one"
+              + (f", {report['from_file']} read from the capture file because the "
+                 "replay returned them empty" if report['from_file'] else ""))
         if report["saved"] == 0 and max_drawcall > 0:
             print("  No usable texture was found for any tile. Run `tools/mmi inspect")
             print("  --textures` on this capture and report what the shader binds.")
+        if report["blank"] and self.file_textures is not None and self.file_textures.error:
+            print(f"  (the capture file could not be read for texture data: "
+                  f"{self.file_textures.error})")
+
+        if self.file_textures is not None:
+            self.file_textures.close()
 
         print("Profiling counters:")
         for key, counter in profiling_counters.items():
@@ -713,7 +729,7 @@ class CaptureScraper():
         ranked.sort(key=lambda entry: (entry[0], entry[1]), reverse=True)
         return ranked
 
-    def extractTexture(self, drawcallId, state):
+    def extractTexture(self, drawcallId, state, eventId=None):
         """Save the tile's colour texture as a png."""
         candidates = self.candidateTextures(state)
         if not candidates:
@@ -727,10 +743,14 @@ class CaptureScraper():
             # OpenGL replay RenderDoc's SaveTexture() reports success for a
             # BC1 texture and writes a black image, while the compressed
             # blocks it hands back are perfectly fine.
-            if self.decodeTextureOurselves(rid, desc, path):
+            how = self.decodeTextureOurselves(rid, desc, path, eventId=eventId)
+            if how is not None and how != BLANK:
                 size = os.path.getsize(path)
-                self.reportTexture(drawcallId, rid, desc, size, position, len(candidates), "decoded")
+                self.reportTexture(drawcallId, rid, desc, size, position, len(candidates), how)
                 return
+            if how == BLANK:
+                self.explainBlank(drawcallId, rid, desc)
+                continue
 
             texsave = rd.TextureSave()
             texsave.resourceId = rid
@@ -762,21 +782,62 @@ class CaptureScraper():
             # Last chance for this candidate: read the raw bytes and convert
             # them ourselves, in case it is the save that failed and not the
             # data.
-            if self.decodeTextureOurselves(rid, desc, path, force=True):
+            how = self.decodeTextureOurselves(rid, desc, path, force=True, eventId=eventId)
+            if how is not None and how != BLANK:
                 size = os.path.getsize(path)
                 if size >= threshold:
-                    self.reportTexture(drawcallId, rid, desc, size, position, len(candidates), "decoded")
+                    self.reportTexture(drawcallId, rid, desc, size, position, len(candidates), how)
                     return
+            if how == BLANK:
+                self.explainBlank(drawcallId, rid, desc)
 
         self.texture_report["blank"] += 1
         # Leave the last attempt in place rather than nothing at all.
 
-    def decodeTextureOurselves(self, rid, desc, path, force=False):
-        """Write the texture as a PNG from its raw bytes. Returns False when
-        the format is not one we decode, or (unless forced) when RenderDoc
-        can be trusted with it."""
+    def textureBytesFromFile(self, rid, desc, eventId):
+        """The texture's level 0 as stored in the capture file, or None."""
+        textures = self.file_textures
+        if textures is None:
+            return None
+        if not textures.loaded:
+            timer = Timer()
+            ok = textures.load(self.controller)
+            profiling_counters["readCaptureFile"].add_sample(timer)
+            if not ok:
+                print(f"  could not read texture uploads from the capture file: {textures.error}")
+        if textures.error:
+            return None
+        try:
+            return textures.levelZero(rid, desc, eventId)
+        except Exception as err:  # noqa: BLE001 - the replay data is still there
+            print(f"  could not rebuild texture {rid} from the capture file: {err}")
+            return None
+
+    def explainBlank(self, drawcallId, rid, desc):
+        """Say once why a texture came out empty."""
+        if "blank_explained" in self.texture_report:
+            return
+        self.texture_report["blank_explained"] = True
+        what = f"{desc.width}x{desc.height} {desc.format.Name()}" if desc is not None else "?"
+        print(f"  texture {rid} ({what}) for drawcall {drawcallId} is all zero in the replay")
+        textures = self.file_textures
+        if textures is None or textures.error:
+            print("   and the capture file could not be consulted for its uploads")
+        else:
+            print(f"   and the capture file holds for it: {textures.describe(rid)}")
+            print("   so RenderDoc never captured what the browser uploaded into it. "
+                  "Try `tools/mmi up --api gles`.")
+
+    def decodeTextureOurselves(self, rid, desc, path, force=False, eventId=None):
+        """Write the texture as a PNG from its raw bytes.
+
+        Returns how it was done ("decoded from the replay" or "... capture
+        file"), BLANK when every source came back all zero (the PNG is still
+        written), or None when the format is not one we decode or (unless
+        forced) when RenderDoc can be trusted with it.
+        """
         if desc is None:
-            return False
+            return None
         fmt = desc.format
         kind = getattr(fmt, "type", None)
         compressed = kind in (rd.ResourceFormatType.BC1, rd.ResourceFormatType.BC2,
@@ -784,10 +845,21 @@ class CaptureScraper():
         plain = (kind == rd.ResourceFormatType.Regular and fmt.compByteWidth == 1
                  and fmt.compCount in (1, 2, 3, 4))
         if not compressed and not (force and plain):
-            return False
+            return None
 
         try:
             raw = self.controller.GetTextureData(rid, rd.Subresource(0, 0, 0))
+            how = "our decoder, from the replay"
+            if rdtexfile.isAllZero(raw):
+                # The replay has nothing in this texture. The capture file
+                # still records what was uploaded into it, so use that.
+                alt = self.textureBytesFromFile(rid, desc, eventId)
+                if alt is not None and not rdtexfile.isAllZero(alt):
+                    raw = alt
+                    how = "our decoder, from the capture file"
+                    self.texture_report["from_file"] += 1
+                else:
+                    how = BLANK
             if kind == rd.ResourceFormatType.BC1:
                 image = bcdecode.decodeBC1(raw, desc.width, desc.height)
             elif kind == rd.ResourceFormatType.BC2:
@@ -799,7 +871,7 @@ class CaptureScraper():
                                              fmt.compCount, fmt.BGRAOrder())
         except (ValueError, RuntimeError) as err:
             print(f"  could not decode {fmt.Name()} texture {rid} ourselves: {err}")
-            return False
+            return None
 
         # RenderDoc writes OpenGL textures top row first, as PNGs are; the raw
         # bytes come in OpenGL's own order, bottom row first. Match RenderDoc,
@@ -807,7 +879,7 @@ class CaptureScraper():
         if self.capture_api in ("GL", "GLES"):
             image = image[::-1]
         bcdecode.writePNG(path, image)
-        return True
+        return how
 
     def reportTexture(self, drawcallId, rid, desc, size, position, count, how):
         self.texture_report["saved"] += 1
@@ -822,7 +894,7 @@ class CaptureScraper():
               f"{what}, {size} bytes, written by {how}")
 
 def main(controller):
-    scraper = CaptureScraper(controller)
+    scraper = CaptureScraper(controller, CAPTURE_FILE)
     scraper.run()
 
 if __name__ == "__main__":

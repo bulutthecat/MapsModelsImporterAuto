@@ -151,6 +151,11 @@ If `tools/mmi status` reports no graphics API on any hooked process, the
 browser is talking to the driver through a path RenderDoc is not hooking. Try:
 
 * `--api gl-egl`, which lets RenderDoc hook EGL instead of GLX;
+* `--api gles`, which runs ANGLE on the driver's OpenGL ES (through EGL)
+  rather than desktop OpenGL. RenderDoc captures ES as well, and on ES it
+  keeps its own copy of every compressed texture upload instead of reading
+  the texture back from the driver, which matters when a capture comes out
+  with empty tile textures (see the troubleshooting entry below);
 * `--api vulkan`, which runs ANGLE on Vulkan and captures that (the RenderDoc
   Vulkan layer is registered for your user by `setup`).
 
@@ -248,14 +253,32 @@ the compressed blocks intact. So BC1/BC2/BC3 textures are now decoded by the
 add-on itself (`bcdecode.py`, numpy only) from the raw bytes, and written as
 PNG directly. The import log reports which path wrote each texture
 (`Texture choice for drawcall 0: bound slot 0 of 1, 256x512 BC1_UNORM, 61234
-bytes, written by decoded`) and ends with `Textures: N saved, N blank, N draw
-calls without one`. `tools/mmi inspect --textures` now also says whether the
-capture holds any data for each bound texture, which separates "RenderDoc
-could not convert it" (fixed) from "it was never captured".
+bytes, written by our decoder, from the replay`) and ends with `Textures: N
+saved, N blank, N draw calls without one`.
+
+**Still black, and every decoded PNG is exactly 2324 bytes** (for 512x512
+tiles; 1180 for 256x512). That is the size of a 512x512 image of nothing:
+the replay handed the decoder a texture that is all zero. The GPU replay of
+the capture, on that machine's driver, does not put the browser's uploads
+back into the texture -- while the capture file itself still records every
+one of them: the `glCompressedTexImage2D` / `glCompressedTexSubImage2D`
+calls the browser made when the tile arrived, and RenderDoc's own snapshot
+of the texture at the start of the frame. So when the replay returns an
+all-zero texture, the add-on now reads the tile straight out of the capture
+file (`rdtexfile.py`: the file's structured data, no GPU involved), replays
+those uploads itself in order up to the draw call, and decodes that. The
+log then says `written by our decoder, from the capture file` and the
+summary counts how many tiles took that route. Should even the file hold
+nothing for a texture, the log says so, with what the file does hold, and
+the remaining option is to capture again with `tools/mmi up --api gles`:
+on OpenGL ES RenderDoc keeps its own copy of every compressed upload rather
+than reading the texture back from the driver. `tools/mmi inspect
+--textures` prints both what the replay returns for each bound texture and
+what the capture file records for it.
 
 **The browser opens but `tools/mmi status` never shows a graphics API.** The
 GPU process is not going through a path RenderDoc hooks. Try `--api gl-egl`,
-then `--api vulkan`, then `tools/mmi up --in-process-gpu`, which runs the GPU
+then `--api gles`, then `--api vulkan`, then `tools/mmi up --in-process-gpu`, which runs the GPU
 code inside the browser process so that no child has to be hooked at all.
 
 **The capture is empty, or the import says no relevant draw calls.** You were
@@ -285,7 +308,7 @@ variable:
 | `MMI_PYTHON` | Interpreter that can import the renderdoc module |
 | `MMI_BROWSER` | Browser executable |
 | `MMI_BLENDER` | Blender executable |
-| `MMI_API` | `gl`, `gl-egl` or `vulkan` |
+| `MMI_API` | `gl`, `gl-egl`, `gles` or `vulkan` |
 | `MMI_URL` | Page to open |
 | `RENDERDOC_VERSION` | RenderDoc tag to build |
 | `CHROME_VERSION` | Chrome for Testing version installed by `install-chromium` |
