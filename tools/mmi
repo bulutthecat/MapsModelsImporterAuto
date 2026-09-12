@@ -35,6 +35,11 @@ CAPTURE_DIR="${CAPTURE_DIR:-$MMI_HOME/captures}"
 OUTPUT_DIR="${OUTPUT_DIR:-$MMI_HOME/output}"
 RUN_DIR="${RUN_DIR:-$MMI_HOME/run}"
 BROWSER_PROFILE="${BROWSER_PROFILE:-$MMI_HOME/browser-profile}"
+# A self-contained Chrome downloaded by `mmi install-chromium`. Preferred over
+# whatever the distribution ships, because it is a plain binary: no snap
+# confinement, no wrapper script, and the same build everywhere.
+CHROME_DIR="${CHROME_DIR:-$MMI_HOME/chrome}"
+CHROME_VERSION="${CHROME_VERSION:-}"
 MMI_PYTHON="${MMI_PYTHON:-}"
 MMI_BROWSER="${MMI_BROWSER:-}"
 MMI_BLENDER="${MMI_BLENDER:-}"
@@ -48,6 +53,7 @@ RENDERDOC_SWIG_PACKAGE="${RENDERDOC_SWIG_PACKAGE:-}"
 # shellcheck source=/dev/null
 [ -f "$MMI_CONFIG" ] && . "$MMI_CONFIG"
 
+BUNDLED_BROWSER="$CHROME_DIR/chrome-linux64/chrome"
 RENDERDOC_MODULE_DIR="$RENDERDOC_PREFIX/lib"
 RENDERDOC_CMD="$RENDERDOC_PREFIX/bin/renderdoccmd"
 CONTROL_FIFO="$RUN_DIR/control"
@@ -105,8 +111,18 @@ find_python() {
     return 1
 }
 
+warn_if_sudo() {
+    if [ "$(id -u)" -eq 0 ] && [ -n "${SUDO_USER:-}" ]; then
+        warn "Running under sudo: HOME is $HOME, so the RenderDoc build and the"
+        warn "configuration of $SUDO_USER are not visible here. Run this without"
+        warn "sudo (only 'setup' ever needs root, and it asks for it itself)."
+    fi
+}
+
 require_python() {
-    find_python || die "No python interpreter can import the renderdoc module. Run: $0 setup"
+    find_python && return 0
+    warn_if_sudo
+    die "No python interpreter can import the renderdoc module. Run: $0 setup"
 }
 
 # The default python of the distribution, which is what we build against.
@@ -131,9 +147,51 @@ is_snap() {
     esac
 }
 
+# Distributions routinely install the browser as a shell script that execs the
+# real binary (Debian's /usr/bin/chromium is one). Launching the wrapper mostly
+# works, but RenderDoc then reports the target as "dash" and any wrapper that
+# does more than exec -- re-exec through a sandbox helper, say -- loses the
+# hook entirely. Resolve to the real executable when we can.
+resolve_browser_binary() {
+    local path="$1"
+    path="$(readlink -f "$path")"
+
+    if head -c 2 "$path" 2>/dev/null | grep -q '#!'; then
+        local real
+        # Ask the wrapper's own exec line first, then fall back to the usual
+        # locations.
+        real="$(grep -oE '(/usr/lib|/usr/lib64|/opt)/[A-Za-z0-9_./-]+' "$path" 2>/dev/null \
+                | while read -r line; do
+                      [ -x "$line" ] && [ ! -d "$line" ] && printf '%s\n' "$line" && break
+                  done)"
+        if [ -z "$real" ]; then
+            local guess
+            for guess in /usr/lib/chromium/chromium \
+                         /usr/lib/chromium-browser/chromium-browser \
+                         /usr/lib64/chromium-browser/chromium-browser \
+                         /opt/google/chrome/chrome \
+                         /opt/brave.com/brave/brave; do
+                [ -x "$guess" ] && { real="$guess"; break; }
+            done
+        fi
+        if [ -n "$real" ] && ! head -c 2 "$real" 2>/dev/null | grep -q '#!'; then
+            printf '%s\n' "$real"
+            return 0
+        fi
+    fi
+
+    printf '%s\n' "$path"
+}
+
 find_browser() {
     if [ -n "$MMI_BROWSER" ]; then
-        printf '%s\n' "$MMI_BROWSER"
+        resolve_browser_binary "$MMI_BROWSER"
+        return 0
+    fi
+    # The browser we downloaded ourselves wins: it is the one configuration we
+    # can actually rely on being the same on every machine.
+    if [ -x "$BUNDLED_BROWSER" ]; then
+        printf '%s\n' "$BUNDLED_BROWSER"
         return 0
     fi
     local candidate path
@@ -144,7 +202,7 @@ find_browser() {
         if is_snap "$path"; then
             continue
         fi
-        printf '%s\n' "$path"
+        resolve_browser_binary "$path"
         return 0
     done
     return 1
@@ -257,6 +315,12 @@ cmd_setup() {
     fi
 
     write_config
+
+    if ! find_browser >/dev/null; then
+        info "No usable browser found, downloading one"
+        cmd_install_chromium
+    fi
+
     info "Setup done. Next: $0 mount && $0 up"
 }
 
@@ -361,6 +425,7 @@ RENDERDOC_SRC="$RENDERDOC_SRC"
 MMI_PYTHON="$python"
 CAPTURE_DIR="$CAPTURE_DIR"
 OUTPUT_DIR="$OUTPUT_DIR"
+CHROME_VERSION="$CHROME_VERSION"
 # MMI_BROWSER="/usr/bin/google-chrome-stable"
 # MMI_BLENDER="/opt/blender/blender"
 # MMI_API="gl"          # gl, gl-egl or vulkan
@@ -454,7 +519,7 @@ cmd_unmount() {
 # doctor
 
 cmd_doctor() {
-    local failures=0
+    local failures=0 warnings=0
 
     info "System"
     if [ -r /etc/os-release ]; then
@@ -492,16 +557,20 @@ print("  ok  module version: %s" % rd.GetVersionString())
     info "Browser"
     local browser
     if browser="$(find_browser)"; then
-        good "$browser"
+        if [ "$browser" = "$BUNDLED_BROWSER" ]; then
+            good "$browser (downloaded by install-chromium)"
+        else
+            good "$browser"
+            info "For a setup that does not depend on the distribution's packaging,"
+            info "run '$0 install-chromium'."
+        fi
     else
         bad "No usable browser found"
         if find_snap_browser >/dev/null; then
             bad "A snap-packaged browser is installed, but snap confinement stops"
-            bad "RenderDoc from hooking it. Install the Google Chrome .deb instead:"
-            bad "  $0 install-chrome"
-        else
-            bad "Install Google Chrome or a non-snap Chromium"
+            bad "RenderDoc from hooking it."
         fi
+        bad "Run '$0 install-chromium' to download a self-contained one."
         failures=$((failures + 1))
     fi
 
@@ -515,7 +584,9 @@ print("  ok  module version: %s" % rd.GetVersionString())
         if target="$(addon_target_dir "$blender")" && [ -e "$target" ]; then
             good "add-on mounted at $target"
         else
-            warn "add-on not mounted (run: $0 mount)"
+            warn "add-on not mounted (run: $0 mount). 'up' does it for you, but"
+            warn "'import' needs it."
+            warnings=$((warnings + 1))
         fi
     else
         bad "Blender not found (set MMI_BLENDER if it is not in PATH)"
@@ -532,7 +603,105 @@ print("  ok  module version: %s" % rd.GetVersionString())
         return 1
     fi
     echo
-    good "Everything looks ready. Run '$0 up' to start capturing."
+    if [ "$warnings" -gt 0 ]; then
+        warn "$warnings thing(s) worth fixing, see above."
+    fi
+    good "Ready to capture. Run '$0 up'."
+}
+
+# -----------------------------------------------------------------------------
+# install-chromium
+#
+# Google publishes self-contained Chrome builds for automation ("Chrome for
+# Testing"), versioned and downloadable as a plain zip. Using one removes every
+# environment difference that breaks the hooking: it is not a snap, not a
+# wrapper script, not tied to the distribution's release cycle, and it needs no
+# root to install.
+
+CFT_VERSIONS_URL="https://googlechromelabs.github.io/chrome-for-testing/last-known-good-versions-with-downloads.json"
+
+cmd_install_chromium() {
+    local version="$CHROME_VERSION" force=0
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --version) version="$2"; shift 2 ;;
+            --force) force=1; shift ;;
+            -h|--help) usage_install_chromium; return 0 ;;
+            *) die "Unknown option for install-chromium: $1" ;;
+        esac
+    done
+
+    if [ -x "$BUNDLED_BROWSER" ] && [ "$force" -eq 0 ]; then
+        good "Already installed: $BUNDLED_BROWSER"
+        info "Pass --force to download it again."
+        return 0
+    fi
+
+    command -v curl >/dev/null 2>&1 || die "install-chromium needs curl"
+
+    local arch url
+    case "$(uname -m)" in
+        x86_64) arch=linux64 ;;
+        aarch64|arm64) arch=linux-arm64 ;;
+        *) die "No Chrome for Testing build for $(uname -m)" ;;
+    esac
+
+    if [ -n "$version" ]; then
+        url="https://storage.googleapis.com/chrome-for-testing-public/$version/$arch/chrome-$arch.zip"
+    else
+        info "Looking up the current Chrome for Testing build"
+        local metadata
+        metadata="$(curl -fsSL --max-time 60 "$CFT_VERSIONS_URL")" \
+            || die "Could not reach $CFT_VERSIONS_URL"
+        url="$(printf '%s' "$metadata" | "$(default_python)" -c '
+import json, sys
+arch = sys.argv[1]
+data = json.load(sys.stdin)
+channel = data["channels"]["Stable"]
+for download in channel["downloads"]["chrome"]:
+    if download["platform"] == arch:
+        print(channel["version"])
+        print(download["url"])
+        break
+' "$arch")"
+        version="$(printf '%s\n' "$url" | head -n 1)"
+        url="$(printf '%s\n' "$url" | tail -n 1)"
+        [ -n "$url" ] || die "Could not find a $arch build in the Chrome for Testing index"
+    fi
+
+    info "Downloading Chrome $version ($arch)"
+    mkdir -p "$CHROME_DIR"
+    local archive="$CHROME_DIR/chrome-$arch.zip"
+    curl -fL --progress-bar --max-time 900 -o "$archive" "$url" \
+        || die "Download failed: $url"
+
+    info "Unpacking into $CHROME_DIR"
+    rm -rf "${CHROME_DIR:?}/chrome-$arch"
+    # python rather than unzip: it is one less package to require, and it lets
+    # us keep the executable bits the archive records.
+    "$(default_python)" - "$archive" "$CHROME_DIR" <<'EOF'
+import os, sys, zipfile
+
+archive, destination = sys.argv[1], sys.argv[2]
+with zipfile.ZipFile(archive) as zf:
+    for info in zf.infolist():
+        path = zf.extract(info, destination)
+        mode = info.external_attr >> 16
+        if mode:
+            os.chmod(path, mode)
+EOF
+    rm -f "$archive"
+
+    # arm64 builds unpack under a different directory name.
+    if [ ! -x "$BUNDLED_BROWSER" ] && [ -x "$CHROME_DIR/chrome-$arch/chrome" ]; then
+        ln -sfn "chrome-$arch" "$CHROME_DIR/chrome-linux64"
+    fi
+    [ -x "$BUNDLED_BROWSER" ] || die "The archive did not contain $BUNDLED_BROWSER"
+
+    CHROME_VERSION="$version"
+    write_config
+    good "Installed Chrome $version at $BUNDLED_BROWSER"
+    info "It will be used automatically from now on."
 }
 
 # -----------------------------------------------------------------------------
@@ -555,17 +724,38 @@ cmd_install_chrome() {
 # launch
 
 browser_arguments() {
-    local api="$1"
+    local api="$1" in_process_gpu="${2:-0}"
+
     # A dedicated profile directory matters: without it a browser that is
     # already running would simply hand our URL over to the existing process
     # and exit, and nothing would ever get hooked.
     printf '%s\n' \
         "--user-data-dir=$BROWSER_PROFILE" \
         "--no-first-run" \
-        "--no-default-browser-check" \
+        "--no-default-browser-check"
+
+    # --no-zygote is what makes this work at all. Chromium normally forks its
+    # child processes from a zygote, and the browser then validates the
+    # zygote's pid through a handshake across a PID namespace. RenderDoc's
+    # hooking of child processes breaks that handshake, and the browser dies
+    # with "zygote_host_impl_linux.cc ... Check failed: No such process".
+    # Without a zygote, children are forked and exec'd directly, which is both
+    # what the handshake stops caring about and what lets RenderDoc's
+    # LD_PRELOAD reach the GPU process. Chromium requires --no-sandbox
+    # alongside it, since the sandbox is built on the zygote.
+    printf '%s\n' \
+        "--no-sandbox" \
+        "--no-zygote" \
         "--disable-gpu-sandbox" \
         "--disable-gpu-watchdog" \
         "--ozone-platform=x11"
+
+    # Last resort: run the GPU code inside the browser process itself, so that
+    # the process RenderDoc launched directly is the one issuing the draw
+    # calls and no child has to be hooked at all.
+    if [ "$in_process_gpu" -eq 1 ]; then
+        printf '%s\n' "--in-process-gpu"
+    fi
 
     case "$api" in
         gl|gl-egl)
@@ -595,8 +785,36 @@ browser_environment() {
     esac
 }
 
+# Chromium refuses to start a second instance on the same profile: it hands
+# its command line to the running one and exits, and RenderDoc then reports a
+# confusing "couldn't connect to target program". Since the profile is ours,
+# we can tell exactly who holds it.
+browser_profile_owner() {
+    local lock="$BROWSER_PROFILE/SingletonLock"
+    [ -L "$lock" ] || return 1
+    local target pid
+    target="$(readlink "$lock")"
+    pid="${target##*-}"
+    case "$pid" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    kill -0 "$pid" 2>/dev/null || return 1
+    printf '%s\n' "$pid"
+}
+
+clear_stale_profile_lock() {
+    if browser_profile_owner >/dev/null; then
+        return 1
+    fi
+    rm -f "$BROWSER_PROFILE/SingletonLock" \
+          "$BROWSER_PROFILE/SingletonCookie" \
+          "$BROWSER_PROFILE/SingletonSocket"
+    return 0
+}
+
 cmd_launch() {
     local url="$MMI_URL" api="$MMI_API" browser="" auto_import=0 glb=0
+    local in_process_gpu=0 replace=0
     local extra_args=()
     while [ $# -gt 0 ]; do
         case "$1" in
@@ -606,6 +824,8 @@ cmd_launch() {
             --auto-import) auto_import=1; shift ;;
             --glb) glb=1; shift ;;
             --earth) url="https://earth.google.com/web/"; shift ;;
+            --in-process-gpu) in_process_gpu=1; shift ;;
+            --replace) replace=1; shift ;;
             --extra-arg) extra_args+=("$2"); shift 2 ;;
             -h|--help) usage_launch; return 0 ;;
             *) die "Unknown option for launch: $1" ;;
@@ -618,12 +838,36 @@ cmd_launch() {
 
     mkdir -p "$CAPTURE_DIR" "$OUTPUT_DIR" "$RUN_DIR" "$BROWSER_PROFILE"
 
+    local owner
+    if owner="$(browser_profile_owner)"; then
+        if [ "$replace" -eq 1 ]; then
+            info "Stopping the browser left over from a previous session (pid $owner)"
+            kill "$owner" 2>/dev/null || true
+            local waited=0
+            while kill -0 "$owner" 2>/dev/null && [ "$waited" -lt 10 ]; do
+                sleep 1
+                waited=$((waited + 1))
+            done
+            kill -9 "$owner" 2>/dev/null || true
+            clear_stale_profile_lock || true
+        else
+            bad "A browser from a previous session is still running (pid $owner)."
+            bad "It owns $BROWSER_PROFILE, so a new one would just hand its"
+            bad "command line over and exit, and nothing would get hooked."
+            die "Close that window, or re-run with --replace to stop it."
+        fi
+    else
+        # A crash leaves the lock behind; clearing it saves a confusing failure.
+        clear_stale_profile_lock || true
+    fi
+
     # Pass browser arguments as --browser-arg=VALUE rather than as two words:
     # most of them start with a dash, and argparse would take them for options
     # of mmi_capture.py itself.
     local args=()
     local line
-    while IFS= read -r line; do args+=("--browser-arg=$line"); done < <(browser_arguments "$api")
+    while IFS= read -r line; do args+=("--browser-arg=$line"); done \
+        < <(browser_arguments "$api" "$in_process_gpu")
     local extra
     for extra in ${extra_args+"${extra_args[@]}"}; do args+=("--browser-arg=$extra"); done
     args+=("--browser-arg=$url")
@@ -638,6 +882,14 @@ cmd_launch() {
         hook=("--on-capture=$hook_cmd")
     fi
 
+    # With the GPU in the browser process there is no child worth following,
+    # and not hooking children keeps us further away from Chromium's process
+    # management.
+    local hook_children=()
+    if [ "$in_process_gpu" -eq 1 ]; then
+        hook_children=(--no-hook-children)
+    fi
+
     info "Browser: $browser"
     info "API mode: $api"
     info "Captures go to $CAPTURE_DIR"
@@ -650,6 +902,7 @@ cmd_launch() {
         --control-fifo "$CONTROL_FIFO" \
         ${envs+"${envs[@]}"} \
         ${hook+"${hook[@]}"} \
+        ${hook_children+"${hook_children[@]}"} \
         "${args[@]}"
 }
 
@@ -663,7 +916,10 @@ cmd_up() {
         esac
     done
 
-    find_python >/dev/null || die "RenderDoc is not built yet. Run: $0 setup"
+    if ! find_python >/dev/null; then
+        warn_if_sudo
+        die "RenderDoc is not built yet. Run: $0 setup"
+    fi
     if [ "$mount" -eq 1 ]; then
         cmd_mount
     fi
@@ -848,6 +1104,8 @@ Other commands:
   stop                 Ask the running session to exit
   import FILE.rdc      Import one capture into a .blend (headless)
   watch                Import every capture that shows up in the capture directory
+  install-chromium     Download a self-contained Chrome into MMI_HOME (no root
+                       needed, and the same build on every machine)
   install-chrome       Install Google Chrome from Google's apt repository
   env                  Print the resolved paths
   clean [what]         Remove captures, output, build or all
@@ -876,6 +1134,18 @@ Usage: $0 setup [options]
 EOF
 }
 
+usage_install_chromium() {
+    cat <<EOF
+Usage: $0 install-chromium [options]
+
+Downloads a self-contained Chrome for Testing build into $CHROME_DIR and uses
+it in preference to whatever browser the system provides. No root required.
+
+  --version VERSION         Specific version to install (default: current stable)
+  --force                   Download again even if one is already installed
+EOF
+}
+
 usage_mount() {
     cat <<EOF
 Usage: $0 mount [options]
@@ -895,6 +1165,10 @@ Usage: $0 launch [options]
   --browser PATH            Browser to launch
   --auto-import             Import every capture into Blender as it is taken
   --glb                     Also export a .glb next to each .blend
+  --in-process-gpu          Run the GPU code inside the browser process, so no
+                            child process has to be hooked. Try this if nothing
+                            ever reports a graphics API
+  --replace                 Stop a browser left running by a previous session
   --extra-arg ARG           Extra browser argument, repeatable
 EOF
 }
@@ -959,6 +1233,7 @@ main() {
         stop) cmd_stop "$@" ;;
         import) cmd_import "$@" ;;
         watch) cmd_watch "$@" ;;
+        install-chromium) cmd_install_chromium "$@" ;;
         install-chrome) cmd_install_chrome "$@" ;;
         env) cmd_env "$@" ;;
         clean) cmd_clean "$@" ;;

@@ -178,6 +178,7 @@ class TargetSet:
         self.client_name = client_name
         self.controls = {}
         self.apis = {}
+        self.saw_graphics_api = False
         # Idents we failed to connect to, and when. RenderDoc reuses idents as
         # processes come and go, so a refusal has to expire or we would end up
         # ignoring the very process we are waiting for.
@@ -267,6 +268,7 @@ class TargetSet:
                 log(f"Browser spawned child process {child.processId}")
                 self.connect(child.ident)
             elif msg_type == rd.TargetControlMessageType.RegisterAPI:
+                self.saw_graphics_api = True
                 api = msg.apiUse
                 state = "capturable" if api.supported else f"NOT capturable: {api.supportMessage}"
                 log(f"Target {ident:#x} initialised {api.name} ({state})")
@@ -448,11 +450,32 @@ class Session:
             self.reapHooks()
 
             if not self.targets.pump(self.onNewCapture):
-                log("The browser exited.")
+                self.reportExit()
                 break
 
         log(f"Session over, {self.capture_count} capture(s) taken.")
         return 0
+
+    def reportExit(self):
+        """Say why the session is over, and what to do about it when the
+        browser died before it ever drew anything."""
+        log("The browser exited.")
+        if self.capture_count > 0 or self.targets.saw_graphics_api:
+            return
+        if time.time() - START_TIME > 20.0:
+            return
+
+        log("")
+        log("It exited almost immediately and never initialised a graphics API,")
+        log("which usually means one of:")
+        log("  - The browser refused to start under RenderDoc. Look for its own")
+        log("    error above; a 'zygote_host_impl_linux.cc ... Check failed'")
+        log("    means the --no-sandbox and --no-zygote flags did not reach it.")
+        log("  - Another copy of the browser was already running and took over")
+        log("    the command line. Close it and try again.")
+        log("  - The GPU process could not start. Try `tools/mmi launch")
+        log("    --in-process-gpu`, which needs no child process at all.")
+        log("")
 
     def _onInterrupt(self, signum, frame):
         if self.stop:
