@@ -1,5 +1,7 @@
 *If this helps you save time or money for your job, please consider supporting the work involved in here ;)* [![Donate](https://www.paypalobjects.com/en_US/i/btn/btn_donate_LG.gif)](https://www.paypal.com/cgi-bin/webscr?cmd=_donations&business=DNEEF8GDX2EV6&currency_code=EUR&source=url)
 
+**News** Version 0.8.0 supports **Blender 4.2 through 5.2** (as a proper extension) and **RenderDoc up to 1.46**, and adds a **Linux workflow**: `tools/mmi` sets RenderDoc up, launches the browser with capture attached, takes the capture and imports it, with no process injection to fiddle with. See [tools/README.md](tools/README.md).
+
 **News** As of January 2024, an extra command line option `--disable_direct_composition=1` is recommended to prevent Chrome from restarting the GPU process.
 
 **News** As of January 2023, Only versions older or equal to 0.5.0 no longer work because the associated version of RenderDoc are no longer able to inject into Chrome. Use version 0.6.0 (for RenderDoc 1.25 and Blender 3.4) or newer!
@@ -21,7 +23,10 @@ The `blender` directory contains the source code of the Blender add-on importing
 Installation
 ------------
 
-Download a [release](https://github.com/eliemichel/MapsModelsImporter/releases) or make a zip of `blender/MapsModelsImporter/`. In Blender 2.83, go to `Edit > Preferences`, `Add-on`, `Install`, then browse to the zip file.
+**Linux users:** skip this section, [tools/README.md](tools/README.md) does all
+of it for you with `tools/mmi setup && tools/mmi up`.
+
+Download a [release](https://github.com/eliemichel/MapsModelsImporter/releases) or make a zip of `blender/MapsModelsImporter/`. In Blender, go to `Edit > Preferences`, `Get Extensions`, then `Install from Disk...` in the drop-down menu at the top right, and browse to the zip file. (On Blender 4.1 and older, use `Add-ons > Install` instead, and note that version 0.8.0 and above of this add-on require Blender 4.2; use 0.7.0 for older versions.)
 
 **/!\ Do not use the "Download as zip" button of GitHub, make sure you use a release zip instead.**
 
@@ -29,6 +34,10 @@ Install [RenderDoc](https://renderdoc.org/builds), get **the very version specif
 
 Usage
 -----
+
+These steps are for Windows. On Linux, see [tools/README.md](tools/README.md)
+instead: the injection dance below does not exist there, `tools/mmi` launches
+the browser with RenderDoc already attached.
 
 You can follow instruction from the walkthrough video: https://youtu.be/X6Q7dbtXVZQ (Slightly out of date, refer to the steps bellow) Alternatively, check out the following steps:
 
@@ -76,7 +85,25 @@ To check your installation, you can try importing sample captures from [MapsMode
 
 ### Linux
 
-Unfortunately, the *inject into process* functionality of RenderDoc is not supported on linux. You can still import existing captures on linux, though.
+The *inject into process* functionality of RenderDoc does not exist on Linux,
+but it is not needed: RenderDoc can launch the browser itself and follow it
+into its GPU child process, which amounts to the same thing. `tools/mmi`
+automates that, along with building the `renderdoc` python module (which the
+official Linux tarball does not ship) and wiring the add-on into Blender:
+
+```
+tools/mmi setup     # once: dependencies + RenderDoc build
+tools/mmi up        # browser with RenderDoc attached, captures auto-imported
+tools/mmi capture --delay 5
+```
+
+See [tools/README.md](tools/README.md) for the details, including what to do
+if your browser comes from snap (it will not work: snap confinement blocks the
+hooking) and how to pick between the OpenGL and Vulkan capture paths.
+
+Importing already existing captures on Linux works too, and only needs the
+`renderdoc` python module: point the add-on at it with the *RenderDoc Module
+Directory* and *Python Executable* preferences.
 
 ### Missing blocks
 
@@ -191,6 +218,14 @@ Changelog
 
 For more details, see individual [releases](https://github.com/eliemichel/MapsModelsImporter/releases).
 
+**v0.8.0** Blender 4.2 to 5.2 support (the add-on is now a Blender extension,
+with a `blender_manifest.toml`), RenderDoc 1.31 to 1.46 support (the constant
+buffer and resource binding APIs changed in RenderDoc 1.34), and a Linux
+workflow under `tools/`. The capture reader can now run under any python that
+has the `renderdoc` module, instead of requiring one built against Blender's
+own python. Draw call detection has an API-agnostic fallback, so OpenGL and
+Vulkan captures work and not just D3D11 ones.
+
 **Aug 23, 2020** *v0.3.0* Captures from Google Earth are now supported. When capturing from Google Earth, there is no need to move around in the viewport when taking the capture. Support for Google Maps is still ensured. Additional add-ons [LilyTexturePacker](https://gumroad.com/l/DFExj) and [LilyCaptureMerger](https://gumroad.com/l/KSvXuu) are compatible with Google Earth Captures.
 
 **Feb 17, 2020** *v0.2.0* A new version is available that should make the whole process easier and work on more hardware. It now uses the last version of RenderDoc (1.6), the last version of Chrome (80) and the last version of Blender (2.82). This is quite a change and if you notice any regression (like it used to work and now it does not) please report!
@@ -200,7 +235,12 @@ For more details, see individual [releases](https://github.com/eliemichel/MapsMo
 Help Wanted
 -----------
 
-This repository does not provide the required RenderDoc binaries for linux nor for OSX. If you have such a system, build RenderDoc against Python 3.9 (the minor version matters) to be compatible with the version of Blender's Python distribution. See [doc/Building RenderDoc module.md](doc/Building%20RenderDoc%20module.md).
+This repository only provides RenderDoc binaries for Windows. On Linux,
+`tools/mmi setup` builds the module for you; see
+[doc/Building RenderDoc module.md](doc/Building%20RenderDoc%20module.md) to do
+it by hand. macOS is still untested — the add-on no longer requires the module
+to be built against Blender's exact python version, so a module built against
+any interpreter that also has numpy should now work; reports welcome.
 
 Other links
 -----------

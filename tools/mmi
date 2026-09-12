@@ -1,0 +1,970 @@
+#!/usr/bin/env bash
+#
+# Copyright (c) 2026 Elie Michel -- MIT license, see Licenses.txt
+#
+# This file is part of MapsModelsImporter, a set of addons to import 3D models
+# from Maps services.
+#
+# mmi -- bring the whole Google Maps capture pipeline up on Linux.
+#
+# The upstream workflow is Windows only because it relies on RenderDoc's
+# "inject into a running process" feature, which does not exist on Linux.
+# Launching the browser from RenderDoc does work though, so everything here is
+# built around that: `mmi setup` builds what is missing, `mmi mount` wires the
+# add-on into Blender, `mmi up` starts the browser with RenderDoc attached and
+# imports every capture you take.
+
+set -euo pipefail
+
+# -----------------------------------------------------------------------------
+# Paths and defaults
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)"
+ADDON_SRC="$REPO_ROOT/blender/MapsModelsImporter"
+ADDON_ID="maps_models_importer"
+
+MMI_HOME="${MMI_HOME:-${XDG_DATA_HOME:-$HOME/.local/share}/maps-models-importer}"
+MMI_CONFIG="${MMI_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/maps-models-importer/config}"
+
+# Overridable from the config file or the environment.
+RENDERDOC_VERSION="${RENDERDOC_VERSION:-v1.46}"
+RENDERDOC_PREFIX="${RENDERDOC_PREFIX:-$MMI_HOME/renderdoc}"
+RENDERDOC_SRC="${RENDERDOC_SRC:-$MMI_HOME/renderdoc-src}"
+CAPTURE_DIR="${CAPTURE_DIR:-$MMI_HOME/captures}"
+OUTPUT_DIR="${OUTPUT_DIR:-$MMI_HOME/output}"
+RUN_DIR="${RUN_DIR:-$MMI_HOME/run}"
+BROWSER_PROFILE="${BROWSER_PROFILE:-$MMI_HOME/browser-profile}"
+MMI_PYTHON="${MMI_PYTHON:-}"
+MMI_BROWSER="${MMI_BROWSER:-}"
+MMI_BLENDER="${MMI_BLENDER:-}"
+MMI_API="${MMI_API:-gl}"
+MMI_URL="${MMI_URL:-https://www.google.com/maps/@48.8584,2.2945,200a,35y,90h/data=!3m1!1e3}"
+MMI_JOBS="${MMI_JOBS:-$(nproc 2>/dev/null || echo 4)}"
+# RenderDoc's build downloads its own fork of SWIG. Point this at a local zip
+# if the machine cannot reach github during the build.
+RENDERDOC_SWIG_PACKAGE="${RENDERDOC_SWIG_PACKAGE:-}"
+
+# shellcheck source=/dev/null
+[ -f "$MMI_CONFIG" ] && . "$MMI_CONFIG"
+
+RENDERDOC_MODULE_DIR="$RENDERDOC_PREFIX/lib"
+RENDERDOC_CMD="$RENDERDOC_PREFIX/bin/renderdoccmd"
+CONTROL_FIFO="$RUN_DIR/control"
+
+# -----------------------------------------------------------------------------
+# Output helpers
+
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+    C_RESET=$'\033[0m'; C_BOLD=$'\033[1m'; C_RED=$'\033[31m'
+    C_GREEN=$'\033[32m'; C_YELLOW=$'\033[33m'; C_BLUE=$'\033[34m'
+else
+    C_RESET=""; C_BOLD=""; C_RED=""; C_GREEN=""; C_YELLOW=""; C_BLUE=""
+fi
+
+info()  { printf '%s==>%s %s\n' "$C_BLUE" "$C_RESET" "$*"; }
+good()  { printf '%s  ok%s  %s\n' "$C_GREEN" "$C_RESET" "$*"; }
+warn()  { printf '%swarn%s  %s\n' "$C_YELLOW" "$C_RESET" "$*" >&2; }
+bad()   { printf '%sfail%s  %s\n' "$C_RED" "$C_RESET" "$*" >&2; }
+die()   { bad "$*"; exit 1; }
+
+as_root() {
+    if [ "$(id -u)" -eq 0 ]; then
+        "$@"
+    elif command -v sudo >/dev/null 2>&1; then
+        sudo "$@"
+    else
+        die "This step needs root privileges and sudo is not available: $*"
+    fi
+}
+
+# -----------------------------------------------------------------------------
+# Discovery
+
+# Interpreters worth trying, best first. The renderdoc module we build is tied
+# to one of them, so the search has to be exhaustive rather than clever.
+candidate_pythons() {
+    [ -n "$MMI_PYTHON" ] && printf '%s\n' "$MMI_PYTHON"
+    local p
+    for p in python3.13 python3.12 python3.11 python3.10 python3; do
+        command -v "$p" 2>/dev/null || true
+    done
+}
+
+# Print the first interpreter that can import renderdoc and numpy.
+find_python() {
+    local python
+    while read -r python; do
+        [ -n "$python" ] || continue
+        if PYTHONPATH="$RENDERDOC_MODULE_DIR${PYTHONPATH:+:$PYTHONPATH}" \
+           "$python" -c 'import renderdoc, numpy' >/dev/null 2>&1; then
+            printf '%s\n' "$python"
+            return 0
+        fi
+    done < <(candidate_pythons | awk '!seen[$0]++')
+    return 1
+}
+
+require_python() {
+    find_python || die "No python interpreter can import the renderdoc module. Run: $0 setup"
+}
+
+# The default python of the distribution, which is what we build against.
+default_python() {
+    if [ -n "$MMI_PYTHON" ]; then
+        printf '%s\n' "$MMI_PYTHON"
+    elif [ -x /usr/bin/python3 ]; then
+        printf '%s\n' /usr/bin/python3
+    else
+        command -v python3
+    fi
+}
+
+python_minor_version() {
+    "$1" -c 'import sys; print("%d.%d" % sys.version_info[:2])'
+}
+
+is_snap() {
+    case "$(readlink -f "$1")" in
+        /snap/*|/var/lib/snapd/*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+find_browser() {
+    if [ -n "$MMI_BROWSER" ]; then
+        printf '%s\n' "$MMI_BROWSER"
+        return 0
+    fi
+    local candidate path
+    for candidate in google-chrome-stable google-chrome chromium chromium-browser \
+                     brave-browser microsoft-edge-stable; do
+        path="$(command -v "$candidate" 2>/dev/null || true)"
+        [ -n "$path" ] || continue
+        if is_snap "$path"; then
+            continue
+        fi
+        printf '%s\n' "$path"
+        return 0
+    done
+    return 1
+}
+
+find_snap_browser() {
+    local candidate path
+    for candidate in chromium chromium-browser google-chrome-stable; do
+        path="$(command -v "$candidate" 2>/dev/null || true)"
+        if [ -n "$path" ] && is_snap "$path"; then
+            printf '%s\n' "$path"
+            return 0
+        fi
+    done
+    return 1
+}
+
+find_blender() {
+    if [ -n "$MMI_BLENDER" ]; then
+        printf '%s\n' "$MMI_BLENDER"
+        return 0
+    fi
+    local path
+    path="$(command -v blender 2>/dev/null || true)"
+    if [ -n "$path" ]; then
+        printf '%s\n' "$path"
+        return 0
+    fi
+    # Blender is very often unpacked by hand rather than installed.
+    for path in "$HOME"/blender*/blender /opt/blender*/blender \
+                /usr/local/blender*/blender; do
+        [ -x "$path" ] && { printf '%s\n' "$path"; return 0; }
+    done
+    return 1
+}
+
+require_blender() {
+    find_blender || die "Could not find Blender. Install it, or set MMI_BLENDER=/path/to/blender"
+}
+
+# Ask Blender itself where its user directories are; guessing the layout from
+# the version number goes wrong as soon as someone uses a portable install.
+blender_paths() {
+    local blender="$1"
+    "$blender" --background --factory-startup --python-exit-code 1 --python-expr '
+import bpy
+try:
+    extensions = bpy.utils.user_resource("EXTENSIONS")
+except (TypeError, ValueError):
+    extensions = ""
+print("MMI_EXTENSIONS=" + extensions)
+print("MMI_SCRIPTS=" + bpy.utils.user_resource("SCRIPTS"))
+print("MMI_VERSION=%d.%d.%d" % bpy.app.version)
+' 2>/dev/null | grep -E '^MMI_(EXTENSIONS|SCRIPTS|VERSION)='
+}
+
+addon_target_dir() {
+    local blender="$1" extensions="" scripts=""
+    local line
+    while IFS= read -r line; do
+        case "$line" in
+            MMI_EXTENSIONS=*) extensions="${line#MMI_EXTENSIONS=}" ;;
+            MMI_SCRIPTS=*) scripts="${line#MMI_SCRIPTS=}" ;;
+        esac
+    done < <(blender_paths "$blender")
+
+    if [ -n "$extensions" ]; then
+        printf '%s\n' "$extensions/user_default/$ADDON_ID"
+    elif [ -n "$scripts" ]; then
+        printf '%s\n' "$scripts/addons/MapsModelsImporter"
+    else
+        return 1
+    fi
+}
+
+# -----------------------------------------------------------------------------
+# setup
+
+APT_PACKAGES=(
+    build-essential cmake git pkg-config
+    libx11-dev libx11-xcb-dev libxcb-keysyms1-dev
+    mesa-common-dev libgl1-mesa-dev
+    bison autoconf automake
+    python3-dev python3-numpy
+)
+
+cmd_setup() {
+    local skip_apt=0 skip_build=0
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --renderdoc-version) RENDERDOC_VERSION="$2"; shift 2 ;;
+            --swig-package) RENDERDOC_SWIG_PACKAGE="$2"; shift 2 ;;
+            --python) MMI_PYTHON="$2"; shift 2 ;;
+            --jobs|-j) MMI_JOBS="$2"; shift 2 ;;
+            --skip-apt) skip_apt=1; shift ;;
+            --skip-build) skip_build=1; shift ;;
+            -h|--help) usage_setup; return 0 ;;
+            *) die "Unknown option for setup: $1" ;;
+        esac
+    done
+
+    mkdir -p "$MMI_HOME" "$CAPTURE_DIR" "$OUTPUT_DIR" "$RUN_DIR"
+
+    if [ "$skip_apt" -eq 0 ]; then
+        install_apt_packages
+    fi
+
+    if [ "$skip_build" -eq 0 ]; then
+        build_renderdoc
+    fi
+
+    write_config
+    info "Setup done. Next: $0 mount && $0 up"
+}
+
+install_apt_packages() {
+    if ! command -v apt-get >/dev/null 2>&1; then
+        warn "This is not a Debian/Ubuntu system; install the equivalent of these yourself:"
+        warn "  ${APT_PACKAGES[*]}"
+        return 0
+    fi
+
+    info "Installing build dependencies"
+    as_root apt-get update -qq
+    # libpcre3 is what RenderDoc's bundled SWIG wants; it is on its way out of
+    # Debian, so fall back to pcre2 rather than failing the whole install.
+    local pcre=libpcre3-dev
+    if ! apt-cache show libpcre3-dev >/dev/null 2>&1; then
+        pcre=libpcre2-dev
+    fi
+    as_root apt-get install -y "${APT_PACKAGES[@]}" "$pcre"
+    good "Dependencies installed"
+}
+
+build_renderdoc() {
+    local python version
+    python="$(default_python)"
+    [ -x "$python" ] || python="$(command -v "$python")"
+    version="$(python_minor_version "$python")"
+
+    info "Building RenderDoc $RENDERDOC_VERSION against python $version ($python)"
+    info "This takes a while (10-30 minutes) and only has to happen once."
+
+    if [ ! -d "$RENDERDOC_SRC/.git" ]; then
+        mkdir -p "$(dirname "$RENDERDOC_SRC")"
+        git clone --depth 1 --branch "$RENDERDOC_VERSION" \
+            https://github.com/baldurk/renderdoc.git "$RENDERDOC_SRC"
+    else
+        info "Reusing the existing checkout in $RENDERDOC_SRC"
+        git -C "$RENDERDOC_SRC" fetch --depth 1 origin "$RENDERDOC_VERSION"
+        git -C "$RENDERDOC_SRC" checkout --force FETCH_HEAD
+    fi
+
+    # qrenderdoc (the Qt UI) is deliberately off: we only need the replay
+    # library, renderdoccmd and the python module, and skipping Qt removes the
+    # heaviest dependency by far.
+    local swig_option=()
+    if [ -n "$RENDERDOC_SWIG_PACKAGE" ]; then
+        swig_option=(-DRENDERDOC_SWIG_PACKAGE="$RENDERDOC_SWIG_PACKAGE")
+    fi
+
+    cmake -S "$RENDERDOC_SRC" -B "$RENDERDOC_SRC/build" \
+        ${swig_option+"${swig_option[@]}"} \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DENABLE_QRENDERDOC=OFF \
+        -DENABLE_PYRENDERDOC=ON \
+        -DENABLE_RENDERDOCCMD=ON \
+        -DFORCE_PY_VERSION="$version" \
+        -DCMAKE_INSTALL_PREFIX="$RENDERDOC_PREFIX" \
+        -DVULKAN_LAYER_FOLDER="$RENDERDOC_PREFIX/etc/vulkan/implicit_layer.d"
+
+    cmake --build "$RENDERDOC_SRC/build" --parallel "$MMI_JOBS"
+    cmake --install "$RENDERDOC_SRC/build"
+
+    # The python module has no install rule of its own, so place it next to
+    # librenderdoc.so, which is where its RPATH ($ORIGIN) will look.
+    local module="$RENDERDOC_SRC/build/lib/renderdoc.so"
+    [ -f "$module" ] || die "The build did not produce $module"
+    mkdir -p "$RENDERDOC_MODULE_DIR"
+    install -m 0755 "$module" "$RENDERDOC_MODULE_DIR/renderdoc.so"
+
+    if [ ! -f "$RENDERDOC_MODULE_DIR/librenderdoc.so" ]; then
+        install -m 0755 "$RENDERDOC_SRC/build/lib/librenderdoc.so" "$RENDERDOC_MODULE_DIR/"
+    fi
+
+    good "RenderDoc installed in $RENDERDOC_PREFIX"
+
+    if PYTHONPATH="$RENDERDOC_MODULE_DIR" "$python" -c 'import renderdoc' 2>/dev/null; then
+        good "$python can import the renderdoc module"
+    else
+        bad "$python still cannot import the renderdoc module:"
+        PYTHONPATH="$RENDERDOC_MODULE_DIR" "$python" -c 'import renderdoc' || true
+        return 1
+    fi
+
+    if [ -x "$RENDERDOC_CMD" ]; then
+        if "$RENDERDOC_CMD" vulkanlayer --register --user >/dev/null 2>&1; then
+            good "RenderDoc's Vulkan layer registered for this user"
+        else
+            warn "Could not register RenderDoc's Vulkan layer (only needed for --api vulkan)"
+        fi
+    fi
+}
+
+write_config() {
+    local python
+    python="$(find_python || default_python)"
+    mkdir -p "$(dirname "$MMI_CONFIG")"
+    cat > "$MMI_CONFIG" <<EOF
+# Written by 'mmi setup'. Edit freely, it is sourced by the mmi script.
+RENDERDOC_VERSION="$RENDERDOC_VERSION"
+RENDERDOC_PREFIX="$RENDERDOC_PREFIX"
+RENDERDOC_SRC="$RENDERDOC_SRC"
+MMI_PYTHON="$python"
+CAPTURE_DIR="$CAPTURE_DIR"
+OUTPUT_DIR="$OUTPUT_DIR"
+# MMI_BROWSER="/usr/bin/google-chrome-stable"
+# MMI_BLENDER="/opt/blender/blender"
+# MMI_API="gl"          # gl, gl-egl or vulkan
+# MMI_URL="https://earth.google.com/web/"
+EOF
+    good "Configuration written to $MMI_CONFIG"
+}
+
+# -----------------------------------------------------------------------------
+# mount
+
+cmd_mount() {
+    local copy=0 blender=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --copy) copy=1; shift ;;
+            --blender) blender="$2"; shift 2 ;;
+            -h|--help) usage_mount; return 0 ;;
+            *) die "Unknown option for mount: $1" ;;
+        esac
+    done
+
+    [ -n "$blender" ] || blender="$(require_blender)"
+    local target
+    target="$(addon_target_dir "$blender")" \
+        || die "Could not ask $blender where its add-ons live"
+
+    info "Mounting the add-on into $target"
+    mkdir -p "$(dirname "$target")"
+
+    if [ -e "$target" ] || [ -L "$target" ]; then
+        if [ -L "$target" ] || [ -d "$target" ]; then
+            rm -rf "$target"
+        else
+            die "$target exists and is not a directory"
+        fi
+    fi
+
+    if [ "$copy" -eq 1 ]; then
+        cp -r "$ADDON_SRC" "$target"
+        good "Copied the add-on (re-run 'mmi mount' after changing the sources)"
+    else
+        ln -s "$ADDON_SRC" "$target"
+        good "Linked $target -> $ADDON_SRC"
+    fi
+
+    local python="" module_dir=""
+    if python="$(find_python)"; then
+        module_dir="$RENDERDOC_MODULE_DIR"
+        good "Add-on will read captures with $python"
+    else
+        warn "No interpreter can import the renderdoc module yet; run '$0 setup'"
+        python=""
+    fi
+
+    local output
+    if ! output="$("$blender" --background --factory-startup \
+            --python "$SCRIPT_DIR/mmi_mount.py" -- \
+            ${python:+--python-exe "$python"} \
+            ${module_dir:+--renderdoc-module-dir "$module_dir"} 2>&1)"; then
+        printf '%s\n' "$output" >&2
+        die "Blender could not enable the add-on"
+    fi
+
+    if printf '%s' "$output" | grep -q '^MMI_RESULT=enabled'; then
+        good "Add-on enabled in Blender and saved to your preferences"
+    else
+        printf '%s\n' "$output" >&2
+        die "Blender did not find the add-on after mounting it. Try: $0 mount --copy"
+    fi
+}
+
+cmd_unmount() {
+    local blender
+    blender="$(require_blender)"
+    local target
+    target="$(addon_target_dir "$blender")" || die "Could not locate Blender's add-on directory"
+
+    "$blender" --background --factory-startup \
+        --python "$SCRIPT_DIR/mmi_mount.py" -- --disable >/dev/null 2>&1 || true
+
+    if [ -e "$target" ] || [ -L "$target" ]; then
+        rm -rf "$target"
+        good "Removed $target"
+    else
+        info "Nothing mounted at $target"
+    fi
+}
+
+# -----------------------------------------------------------------------------
+# doctor
+
+cmd_doctor() {
+    local failures=0
+
+    info "System"
+    if [ -r /etc/os-release ]; then
+        # shellcheck source=/dev/null
+        good "$(. /etc/os-release && printf '%s' "$PRETTY_NAME")"
+    fi
+    case "${XDG_SESSION_TYPE:-}" in
+        wayland)
+            warn "You are on Wayland. RenderDoc's Wayland support is experimental;"
+            warn "the browser is started with --ozone-platform=x11 so that it goes"
+            warn "through XWayland, which is the supported path."
+            ;;
+        x11) good "X11 session" ;;
+        *) info "Session type: ${XDG_SESSION_TYPE:-unknown}" ;;
+    esac
+
+    info "RenderDoc"
+    local python
+    if python="$(find_python)"; then
+        good "renderdoc module importable by $python"
+        PYTHONPATH="$RENDERDOC_MODULE_DIR${PYTHONPATH:+:$PYTHONPATH}" "$python" -c '
+import renderdoc as rd
+print("  ok  module version: %s" % rd.GetVersionString())
+' 2>/dev/null || true
+    else
+        bad "No interpreter can import the renderdoc module (run: $0 setup)"
+        failures=$((failures + 1))
+    fi
+    if [ -x "$RENDERDOC_CMD" ]; then
+        good "renderdoccmd at $RENDERDOC_CMD"
+    else
+        warn "renderdoccmd not found at $RENDERDOC_CMD (only needed for the Vulkan layer)"
+    fi
+
+    info "Browser"
+    local browser
+    if browser="$(find_browser)"; then
+        good "$browser"
+    else
+        bad "No usable browser found"
+        if find_snap_browser >/dev/null; then
+            bad "A snap-packaged browser is installed, but snap confinement stops"
+            bad "RenderDoc from hooking it. Install the Google Chrome .deb instead:"
+            bad "  $0 install-chrome"
+        else
+            bad "Install Google Chrome or a non-snap Chromium"
+        fi
+        failures=$((failures + 1))
+    fi
+
+    info "Blender"
+    local blender
+    if blender="$(find_blender)"; then
+        local version
+        version="$("$blender" --version 2>/dev/null | head -n 1)"
+        good "$blender ($version)"
+        local target
+        if target="$(addon_target_dir "$blender")" && [ -e "$target" ]; then
+            good "add-on mounted at $target"
+        else
+            warn "add-on not mounted (run: $0 mount)"
+        fi
+    else
+        bad "Blender not found (set MMI_BLENDER if it is not in PATH)"
+        failures=$((failures + 1))
+    fi
+
+    info "Directories"
+    good "captures: $CAPTURE_DIR"
+    good "output:   $OUTPUT_DIR"
+
+    if [ "$failures" -gt 0 ]; then
+        echo
+        bad "$failures problem(s) found."
+        return 1
+    fi
+    echo
+    good "Everything looks ready. Run '$0 up' to start capturing."
+}
+
+# -----------------------------------------------------------------------------
+# install-chrome
+
+cmd_install_chrome() {
+    command -v apt-get >/dev/null 2>&1 || die "install-chrome only supports Debian/Ubuntu"
+    info "Installing Google Chrome from Google's apt repository"
+    as_root install -d -m 0755 /etc/apt/keyrings
+    curl -fsSL https://dl.google.com/linux/linux_signing_key.pub \
+        | as_root gpg --dearmor -o /etc/apt/keyrings/google-chrome.gpg
+    echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/google-chrome.gpg] http://dl.google.com/linux/chrome/deb/ stable main" \
+        | as_root tee /etc/apt/sources.list.d/google-chrome.list >/dev/null
+    as_root apt-get update -qq
+    as_root apt-get install -y google-chrome-stable
+    good "Installed $(command -v google-chrome-stable)"
+}
+
+# -----------------------------------------------------------------------------
+# launch
+
+browser_arguments() {
+    local api="$1"
+    # A dedicated profile directory matters: without it a browser that is
+    # already running would simply hand our URL over to the existing process
+    # and exit, and nothing would ever get hooked.
+    printf '%s\n' \
+        "--user-data-dir=$BROWSER_PROFILE" \
+        "--no-first-run" \
+        "--no-default-browser-check" \
+        "--disable-gpu-sandbox" \
+        "--disable-gpu-watchdog" \
+        "--ozone-platform=x11"
+
+    case "$api" in
+        gl|gl-egl)
+            # Force ANGLE onto desktop GL, which is what RenderDoc hooks.
+            printf '%s\n' "--use-angle=gl" "--disable-features=Vulkan"
+            ;;
+        vulkan)
+            printf '%s\n' "--use-angle=vulkan" "--enable-features=Vulkan"
+            ;;
+        *)
+            die "Unknown API '$api' (expected gl, gl-egl or vulkan)"
+            ;;
+    esac
+}
+
+browser_environment() {
+    local api="$1"
+    case "$api" in
+        gl)
+            # Same trick as the Windows instructions: keep RenderDoc off EGL so
+            # that it hooks the GLX calls ANGLE makes underneath instead.
+            printf '%s\n' "RENDERDOC_HOOK_EGL=0"
+            ;;
+        gl-egl)
+            printf '%s\n' "RENDERDOC_HOOK_EGL=1"
+            ;;
+    esac
+}
+
+cmd_launch() {
+    local url="$MMI_URL" api="$MMI_API" browser="" auto_import=0 glb=0
+    local extra_args=()
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --url) url="$2"; shift 2 ;;
+            --api) api="$2"; shift 2 ;;
+            --browser) browser="$2"; shift 2 ;;
+            --auto-import) auto_import=1; shift ;;
+            --glb) glb=1; shift ;;
+            --earth) url="https://earth.google.com/web/"; shift ;;
+            --extra-arg) extra_args+=("$2"); shift 2 ;;
+            -h|--help) usage_launch; return 0 ;;
+            *) die "Unknown option for launch: $1" ;;
+        esac
+    done
+
+    local python
+    python="$(require_python)"
+    [ -n "$browser" ] || browser="$(find_browser)" || die "No usable browser found (see: $0 doctor)"
+
+    mkdir -p "$CAPTURE_DIR" "$OUTPUT_DIR" "$RUN_DIR" "$BROWSER_PROFILE"
+
+    # Pass browser arguments as --browser-arg=VALUE rather than as two words:
+    # most of them start with a dash, and argparse would take them for options
+    # of mmi_capture.py itself.
+    local args=()
+    local line
+    while IFS= read -r line; do args+=("--browser-arg=$line"); done < <(browser_arguments "$api")
+    local extra
+    for extra in ${extra_args+"${extra_args[@]}"}; do args+=("--browser-arg=$extra"); done
+    args+=("--browser-arg=$url")
+
+    local envs=()
+    while IFS= read -r line; do envs+=("--env=$line"); done < <(browser_environment "$api")
+
+    local hook=()
+    if [ "$auto_import" -eq 1 ]; then
+        local hook_cmd="$SCRIPT_DIR/mmi import --quiet"
+        [ "$glb" -eq 1 ] && hook_cmd="$hook_cmd --glb"
+        hook=("--on-capture=$hook_cmd")
+    fi
+
+    info "Browser: $browser"
+    info "API mode: $api"
+    info "Captures go to $CAPTURE_DIR"
+
+    PYTHONPATH="$RENDERDOC_MODULE_DIR${PYTHONPATH:+:$PYTHONPATH}" \
+    LD_LIBRARY_PATH="$RENDERDOC_MODULE_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+    exec "$python" "$SCRIPT_DIR/mmi_capture.py" \
+        --browser "$browser" \
+        --capture-dir "$CAPTURE_DIR" \
+        --control-fifo "$CONTROL_FIFO" \
+        ${envs+"${envs[@]}"} \
+        ${hook+"${hook[@]}"} \
+        "${args[@]}"
+}
+
+cmd_up() {
+    local mount=1 args=()
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --no-mount) mount=0; shift ;;
+            -h|--help) usage_up; return 0 ;;
+            *) args+=("$1"); shift ;;
+        esac
+    done
+
+    find_python >/dev/null || die "RenderDoc is not built yet. Run: $0 setup"
+    if [ "$mount" -eq 1 ]; then
+        cmd_mount
+    fi
+    cmd_launch --auto-import ${args+"${args[@]}"}
+}
+
+# -----------------------------------------------------------------------------
+# capture / status
+
+send_command() {
+    [ -p "$CONTROL_FIFO" ] || die "No session is running (start one with: $0 up)"
+    printf '%s\n' "$*" > "$CONTROL_FIFO"
+}
+
+cmd_capture() {
+    local delay=0 frames=1
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --delay|-d) delay="$2"; shift 2 ;;
+            --frames|-n) frames="$2"; shift 2 ;;
+            -h|--help) usage_capture; return 0 ;;
+            *) die "Unknown option for capture: $1" ;;
+        esac
+    done
+
+    if [ "$delay" -gt 0 ]; then
+        info "Capturing in ${delay}s -- start moving in the 3D view now!"
+        local remaining="$delay"
+        while [ "$remaining" -gt 0 ]; do
+            printf '\r  %2ds...' "$remaining"
+            sleep 1
+            remaining=$((remaining - 1))
+        done
+        printf '\r        \r'
+    fi
+    send_command "capture $frames"
+    good "Capture requested"
+}
+
+cmd_status() { send_command "status"; }
+cmd_stop()   { send_command "quit"; }
+
+# -----------------------------------------------------------------------------
+# import / watch
+
+cmd_import() {
+    local quiet=0 glb=0 out="" max_blocks=-1 experimental=0 capture=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --quiet|-q) quiet=1; shift ;;
+            --glb) glb=1; shift ;;
+            --out|-o) out="$2"; shift 2 ;;
+            --max-blocks) max_blocks="$2"; shift 2 ;;
+            --experimental) experimental=1; shift ;;
+            -h|--help) usage_import; return 0 ;;
+            -*) die "Unknown option for import: $1" ;;
+            *) capture="$1"; shift ;;
+        esac
+    done
+
+    [ -n "$capture" ] || die "Usage: $0 import CAPTURE.rdc"
+    [ -f "$capture" ] || die "No such file: $capture"
+
+    local blender python base
+    blender="$(require_blender)"
+    python="$(require_python)"
+    base="$(basename "${capture%.rdc}")"
+    [ -n "$out" ] || out="$OUTPUT_DIR/$base.blend"
+    mkdir -p "$(dirname "$out")" "$OUTPUT_DIR"
+
+    local extra_args=()
+    [ "$glb" -eq 1 ] && extra_args+=(--glb "${out%.blend}.glb")
+    [ "$experimental" -eq 1 ] && extra_args+=(--experimental)
+
+    info "Importing $(basename "$capture") into $out"
+
+    local log="$OUTPUT_DIR/$base.log"
+    # Without --python-exit-code, Blender exits 0 even when the script raises.
+    if "$blender" --background --factory-startup --python-exit-code 1 \
+            --python "$SCRIPT_DIR/mmi_blender.py" -- \
+            --capture "$capture" \
+            --blend "$out" \
+            --max-blocks "$max_blocks" \
+            --tmp-dir "$MMI_HOME/tmp" \
+            --python-exe "$python" \
+            --renderdoc-module-dir "$RENDERDOC_MODULE_DIR" \
+            ${extra_args+"${extra_args[@]}"} \
+            > "$log" 2>&1; then
+        good "Wrote $out"
+        [ "$glb" -eq 1 ] && good "Wrote ${out%.blend}.glb"
+        [ "$quiet" -eq 1 ] || tail -n 5 "$log"
+    else
+        bad "The import failed, see $log"
+        tail -n 30 "$log" >&2
+        return 1
+    fi
+}
+
+cmd_watch() {
+    local glb=0
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --glb) glb=1; shift ;;
+            -h|--help) usage_watch; return 0 ;;
+            *) die "Unknown option for watch: $1" ;;
+        esac
+    done
+
+    mkdir -p "$CAPTURE_DIR"
+    info "Watching $CAPTURE_DIR for new captures (Ctrl+C to stop)"
+
+    local seen="$RUN_DIR/imported"
+    mkdir -p "$RUN_DIR"
+    touch "$seen"
+
+    local capture name
+    while true; do
+        for capture in "$CAPTURE_DIR"/*.rdc; do
+            [ -e "$capture" ] || continue
+            name="$(basename "$capture")"
+            grep -qxF "$name" "$seen" && continue
+            # Give RenderDoc time to finish writing the file.
+            sleep 1
+            printf '%s\n' "$name" >> "$seen"
+            if [ "$glb" -eq 1 ]; then
+                cmd_import --glb "$capture" || true
+            else
+                cmd_import "$capture" || true
+            fi
+        done
+        sleep 2
+    done
+}
+
+# -----------------------------------------------------------------------------
+# misc
+
+cmd_env() {
+    cat <<EOF
+MMI_HOME=$MMI_HOME
+MMI_CONFIG=$MMI_CONFIG
+RENDERDOC_PREFIX=$RENDERDOC_PREFIX
+RENDERDOC_MODULE_DIR=$RENDERDOC_MODULE_DIR
+CAPTURE_DIR=$CAPTURE_DIR
+OUTPUT_DIR=$OUTPUT_DIR
+CONTROL_FIFO=$CONTROL_FIFO
+MMI_PYTHON=$(find_python || echo "<none>")
+MMI_BROWSER=$(find_browser || echo "<none>")
+MMI_BLENDER=$(find_blender || echo "<none>")
+PYTHONPATH=$RENDERDOC_MODULE_DIR
+EOF
+}
+
+cmd_clean() {
+    local what="${1:-captures}"
+    case "$what" in
+        captures) rm -f "$CAPTURE_DIR"/*.rdc; rm -f "$RUN_DIR/imported"; good "Captures removed" ;;
+        output) rm -rf "${OUTPUT_DIR:?}"/*; good "Outputs removed" ;;
+        build) rm -rf "$RENDERDOC_SRC/build"; good "RenderDoc build tree removed" ;;
+        all) rm -rf "$MMI_HOME"; good "$MMI_HOME removed" ;;
+        *) die "clean: expected one of captures, output, build, all" ;;
+    esac
+}
+
+# -----------------------------------------------------------------------------
+# usage
+
+usage() {
+    cat <<EOF
+${C_BOLD}mmi${C_RESET} -- Maps Models Importer, end to end, on Linux
+
+  ${C_BOLD}$0 setup${C_RESET}              Install dependencies and build RenderDoc's python module
+  ${C_BOLD}$0 mount${C_RESET}              Link the add-on into Blender and enable it
+  ${C_BOLD}$0 up${C_RESET}                 Mount, start the browser under RenderDoc, auto-import captures
+  ${C_BOLD}$0 capture${C_RESET}            Take a capture in the running session
+  ${C_BOLD}$0 doctor${C_RESET}             Check that everything is in place
+
+Other commands:
+  unmount              Remove the add-on from Blender
+  launch               Like 'up' but without mounting or auto-importing
+  status               Show what the running session is hooked into
+  stop                 Ask the running session to exit
+  import FILE.rdc      Import one capture into a .blend (headless)
+  watch                Import every capture that shows up in the capture directory
+  install-chrome       Install Google Chrome from Google's apt repository
+  env                  Print the resolved paths
+  clean [what]         Remove captures, output, build or all
+
+Typical first run:
+  $0 setup
+  $0 up
+  # ... navigate to a 3D view, then from another terminal:
+  $0 capture --delay 5      # start dragging the view during the countdown
+
+Run '$0 <command> --help' for the options of a command.
+EOF
+}
+
+usage_setup() {
+    cat <<EOF
+Usage: $0 setup [options]
+
+  --renderdoc-version TAG   RenderDoc tag to build (default $RENDERDOC_VERSION)
+  --python PATH             Interpreter to build the module for (default: the system python3)
+  --jobs, -j N              Parallel build jobs (default $MMI_JOBS)
+  --swig-package PATH       Local copy of RenderDoc's SWIG fork zip, for
+                            machines that cannot download it during the build
+  --skip-apt                Do not install system packages
+  --skip-build              Do not build RenderDoc
+EOF
+}
+
+usage_mount() {
+    cat <<EOF
+Usage: $0 mount [options]
+
+  --copy                    Copy the add-on instead of symlinking it
+  --blender PATH            Blender to mount into
+EOF
+}
+
+usage_launch() {
+    cat <<EOF
+Usage: $0 launch [options]
+
+  --url URL                 Page to open (default: Google Maps over Paris)
+  --earth                   Shorthand for Google Earth's URL
+  --api gl|gl-egl|vulkan    Which graphics API to capture (default $MMI_API)
+  --browser PATH            Browser to launch
+  --auto-import             Import every capture into Blender as it is taken
+  --glb                     Also export a .glb next to each .blend
+  --extra-arg ARG           Extra browser argument, repeatable
+EOF
+}
+
+usage_up() {
+    cat <<EOF
+Usage: $0 up [launch options]
+
+Runs 'mount' then 'launch --auto-import'. Accepts every option of 'launch',
+plus:
+  --no-mount                Skip the mount step
+EOF
+}
+
+usage_capture() {
+    cat <<EOF
+Usage: $0 capture [options]
+
+  --delay, -d SECONDS       Count down before capturing, so you can start
+                            moving in the 3D view (Google Maps only streams the
+                            3D geometry while the view moves)
+  --frames, -n N            Capture N consecutive frames
+EOF
+}
+
+usage_import() {
+    cat <<EOF
+Usage: $0 import [options] CAPTURE.rdc
+
+  --out, -o PATH            Where to write the .blend (default: $OUTPUT_DIR)
+  --glb                     Also export a .glb
+  --max-blocks N            Limit the number of imported draw calls
+  --experimental            Use the experimental draw call extraction
+  --quiet, -q               Only report the result
+EOF
+}
+
+usage_watch() {
+    cat <<EOF
+Usage: $0 watch [--glb]
+
+Imports every .rdc that appears in $CAPTURE_DIR.
+EOF
+}
+
+# -----------------------------------------------------------------------------
+
+main() {
+    local command="${1:-help}"
+    if [ $# -gt 0 ]; then
+        shift
+    fi
+    case "$command" in
+        setup) cmd_setup "$@" ;;
+        mount) cmd_mount "$@" ;;
+        unmount) cmd_unmount "$@" ;;
+        doctor) cmd_doctor "$@" ;;
+        launch) cmd_launch "$@" ;;
+        up) cmd_up "$@" ;;
+        capture) cmd_capture "$@" ;;
+        status) cmd_status "$@" ;;
+        stop) cmd_stop "$@" ;;
+        import) cmd_import "$@" ;;
+        watch) cmd_watch "$@" ;;
+        install-chrome) cmd_install_chrome "$@" ;;
+        env) cmd_env "$@" ;;
+        clean) cmd_clean "$@" ;;
+        help|-h|--help) usage ;;
+        *) bad "Unknown command: $command"; echo; usage; exit 1 ;;
+    esac
+}
+
+main "$@"

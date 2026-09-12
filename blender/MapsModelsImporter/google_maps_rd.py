@@ -1,4 +1,4 @@
-# Copyright (c) 2019 - 2024 Elie Michel
+# Copyright (c) 2019 - 2026 Elie Michel
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
 # of this software and associated documentation files (the “Software”), to deal
@@ -23,17 +23,22 @@
 
 MSG_RD_IMPORT_FAILED = """Error: Failed to load the RenderDoc Module. It however seems to exist.
 This might be due to one of the following reasons:
- - Your Blender version uses another version of python than used to build the RenderDoc Module
- - An additional file required by the RenderDoc Module is missing (i.E. renderdoc.dll)
+ - The python running this script is not the version the RenderDoc Module was built against
+ - An additional file required by the RenderDoc Module is missing (i.e. renderdoc.dll on
+   Windows, librenderdoc.so on Linux)
  - Something completely different
 
 Remember, you must use exactly the same version of python to load the RenderDoc Module as was used to build it.
 Find more information about building the RenderDoc Module here: https://github.com/baldurk/renderdoc/blob/v1.x/docs/CONTRIBUTING/Compiling.md\n"""
 
+import os
 import sys
 import pickle
-import struct
 import numpy as np
+
+# The name-based scraping strategies are extremely chatty; keep their output
+# behind a switch so that the debug log stays readable.
+VERBOSE = bool(os.environ.get("MAPSMODELSIMPORTER_VERBOSE"))
 
 try:
     import renderdoc as rd
@@ -51,12 +56,23 @@ except ImportError as err:
     print("Error Message: ", err,"\n")
     sys.exit(21)
 
+import rdcompat
+from rdcompat import Drawcall
 from meshdata import MeshData, makeMeshData
 from profiling import Timer, profiling_counters
 from rdutils import CaptureWrapper
 
 _, CAPTURE_FILE, FILEPREFIX, MAX_BLOCKS_STR = sys.argv[:4]
 MAX_BLOCKS = int(MAX_BLOCKS_STR)
+
+# Uniforms that identify the vertex shader drawing the 3D tiles, per capture
+# type. These names are what the various services' shaders end up with once
+# they have gone through the browser's shader translator.
+CAPTURE_TYPE_UNIFORMS = {
+    "Google Maps": ("_w", "_s"),
+    "Google Earth": ("_uMeshToWorldMatrix",),
+    "Mapy CZ": ("_uMV", "_uParams"),
+}
 
 def numpySave(array, file):
     np.array([array.ndim], dtype=np.int32).tofile(file)
@@ -68,24 +84,27 @@ def numpySave(array, file):
 class CaptureScraper():
     def __init__(self, controller):
         self.controller = controller
+        self._uniform_names_cache = {}
 
     def findDrawcallBatch(self, drawcalls, first_call_prefix, drawcall_prefix, last_call_prefix):
         batch = []
         has_batch_started = False
+        last_call_index = 0
         for last_call_index, draw in enumerate(drawcalls):
             if has_batch_started:
                 if not draw.name.startswith(drawcall_prefix):
                     if draw.name.startswith(last_call_prefix) and batch != []:
                         break
                     else:
-                        print("(Skipping drawcall {})".format(draw.name))
+                        if VERBOSE:
+                            print("(Skipping drawcall {})".format(draw.name))
                         continue
                 batch.append(draw)
             elif draw.name.startswith(first_call_prefix):
                 has_batch_started = True
                 if draw.name.startswith(drawcall_prefix):
                     batch.append(draw)
-            else:
+            elif VERBOSE:
                 print(f"Not relevant yet: {draw.name}")
         return batch, last_call_index
 
@@ -99,50 +118,73 @@ class CaptureScraper():
         ep = state.GetShaderEntryPoint(rd.ShaderStage.Vertex)
         ref = state.GetShaderReflection(rd.ShaderStage.Vertex)
         constants = {}
+        if ref is None:
+            return constants
         for cbn, cb in enumerate(ref.constantBlocks):
             block = {}
-            cbuff = state.GetConstantBuffer(rd.ShaderStage.Vertex, cbn, 0)
+            resource_id, offset, size = rdcompat.getConstantBufferBinding(
+                state, rd.ShaderStage.Vertex, cbn
+            )
             variables = controller.GetCBufferVariableContents(
                 state.GetGraphicsPipelineObject(),
                 shader,
                 rd.ShaderStage.Vertex,
                 ep,
-                cb.bindPoint,
-                cbuff.resourceId,
-                0,
-                0
+                rdcompat.getConstantBlockSlot(cb, cbn),
+                resource_id,
+                offset,
+                size
             )
             for var in variables:
-                val = 0
                 if var.members:
                     val = []
                     for member in var.members:
-                        memval = 0
-                        if member.type == rd.VarType.Float:
-                            memval = member.value.f32v[:member.rows * member.columns]
-                        elif member.type == rd.VarType.SInt:
-                            memval = member.value.s32v[:member.rows * member.columns]
-                        else:
-                            print("Unsupported type!")
-                        # ...
+                        memval = rdcompat.shaderVariableValue(member)
+                        if memval is None:
+                            print(f"Unsupported type for {cb.name}.{var.name}.{member.name}!")
+                            memval = 0
                         val.append(memval)
                 else:
-                    if var.type == rd.VarType.Float:
-                        val = var.value.f32v[:var.rows * var.columns]
-                    elif var.type == rd.VarType.SInt:
-                        val = var.value.s32v[:var.rows * var.columns]
-                    else:
-                        print("Unsupported type!")
-                    # ...
+                    val = rdcompat.shaderVariableValue(var)
+                    if val is None:
+                        print(f"Unsupported type for {cb.name}.{var.name}!")
+                        val = 0
                 block[var.name] = val
             constants[cb.name] = block
         return constants
 
-    def hasUniform(self, draw, uniform):
-        constants = self.getVertexShaderConstants(draw)
-        return '$Globals' in constants and uniform in constants['$Globals']
+    def getVertexUniformNames(self, draw):
+        """Names of the constants declared by a draw call's vertex shader.
+        Read from the reflection data only, so no buffer contents are fetched:
+        this is cheap enough to run over every draw call of a capture."""
+        cached = self._uniform_names_cache.get(draw.eventId)
+        if cached is not None:
+            return cached
+        self.controller.SetFrameEvent(draw.eventId, False)
+        state = self.controller.GetPipelineState()
+        names = rdcompat.constantBlockVariableNames(
+            state.GetShaderReflection(rd.ShaderStage.Vertex)
+        )
+        self._uniform_names_cache[draw.eventId] = names
+        return names
 
-    def extractRelevantCalls(self, drawcalls, _strategy=4):
+    def hasUniform(self, draw, uniform):
+        return uniform in self.getVertexUniformNames(draw)
+
+    def detectCaptureType(self, draw):
+        """Which service, if any, a draw call belongs to, from the uniforms its
+        vertex shader declares."""
+        names = self.getVertexUniformNames(draw)
+        for capture_type, uniforms in CAPTURE_TYPE_UNIFORMS.items():
+            if all(u in names for u in uniforms):
+                return capture_type
+        # The Google Maps shaders come in a couple of flavours depending on the
+        # browser's shader translator.
+        if "webgl_3c7b7f37a9bd4c1d" in names or "_webgl_3c7b7f37a9bd4c1d" in names:
+            return "Google Maps"
+        return None
+
+    def extractRelevantCalls(self, drawcalls, _strategy=0):
         """List the drawcalls related to drawing the 3D meshes thank to a ad hoc heuristic
         It may different in RenderDoc UI and in Python module, for some reason
         """
@@ -197,8 +239,12 @@ class CaptureScraper():
                     break # Found a good draw call
                 min_drawcall += new_min_drawcall
         else:
-            print("Error: Could not find the beginning of the relevant 3D draw calls")
-            return [], "none"
+            # Every name-based strategy failed. Fall back on looking at what the
+            # shaders actually declare, which does not care about the graphics
+            # API the capture was taken with. This is what makes captures taken
+            # on Linux (OpenGL or Vulkan) work, where none of the D3D11 call
+            # names above ever show up.
+            return self.extractRelevantCallsByUniforms(drawcalls)
 
         print(f"Trying scraping strategy #{_strategy} (from draw call #{min_drawcall})...")
         relevant_drawcalls, new_min_drawcall = self.findDrawcallBatch(
@@ -206,7 +252,7 @@ class CaptureScraper():
             first_call,
             drawcall_prefix,
             last_call)
-        
+
         if not relevant_drawcalls:
             return self.extractRelevantCalls(drawcalls, _strategy=_strategy+1)
 
@@ -257,13 +303,43 @@ class CaptureScraper():
 
         return relevant_drawcalls, capture_type
 
+    def extractRelevantCallsByUniforms(self, drawcalls):
+        """API-agnostic fallback: keep every indexed draw call whose vertex
+        shader declares the uniforms one of the supported services uses.
 
-    def consolidateEvents(self, rootList, accumulator = []):
+        Unlike the strategies above this makes no assumption about how the
+        driver names its draw calls, so it works the same for D3D11, OpenGL and
+        Vulkan captures. It is slower, because it has to look at the pipeline
+        state of every draw call, hence its use as a last resort only."""
+        print("Trying scraping strategy 'by uniform' (API agnostic)...")
+
+        candidates = [draw for draw in drawcalls if rdcompat.isIndexedDrawcall(draw)]
+        print(f"Examining {len(candidates)} indexed draw calls...")
+
+        per_type = {}
+        for draw in candidates:
+            capture_type = self.detectCaptureType(draw)
+            if capture_type is not None:
+                per_type.setdefault(capture_type, []).append(draw)
+
+        if not per_type:
+            print("Error: Could not find the beginning of the relevant 3D draw calls")
+            return [], "none"
+
+        # If several services matched (they should not), go with the one that
+        # accounts for the most geometry.
+        capture_type = max(per_type, key=lambda t: len(per_type[t]))
+        relevant_drawcalls = per_type[capture_type]
+        print(f"Found {len(relevant_drawcalls)} relevant draw calls.")
+        return relevant_drawcalls, capture_type
+
+    def consolidateEvents(self, rootList, accumulator=None):
+        if accumulator is None:
+            accumulator = []
+        sdfile = self.controller.GetStructuredFile()
         for root in rootList:
-            name = root.GetName(self.controller.GetStructuredFile())
-            event = root
-            setattr(root, 'name', name.split('::', 1)[-1])
-            accumulator.append(event)
+            name = root.GetName(sdfile)
+            accumulator.append(Drawcall(root, name.split('::', 1)[-1]))
             self.consolidateEvents(root.children, accumulator)
         return accumulator
 
@@ -273,10 +349,17 @@ class CaptureScraper():
         timer = Timer()
         drawcalls = self.consolidateEvents(controller.GetRootActions())
         profiling_counters['consolidateEvents'].add_sample(timer)
-        
+
         timer = Timer()
         relevant_drawcalls, capture_type = self.extractRelevantCalls(drawcalls)
         profiling_counters['extractRelevantCalls'].add_sample(timer)
+
+        if not relevant_drawcalls:
+            raise RuntimeError(
+                "Could not find any relevant draw call in this capture. "
+                "Please check that it was taken from Google Maps, Google Earth "
+                "or Mapy CZ, while moving in the 3D view."
+            )
 
         print(f"Scraping capture from {capture_type}...")
 
@@ -287,8 +370,7 @@ class CaptureScraper():
 
         for drawcallId, draw in enumerate(relevant_drawcalls[:max_drawcall]):
             timer = Timer()
-            #print("Draw call: " + draw.name)
-            
+
             controller.SetFrameEvent(draw.eventId, True)
             state = controller.GetPipelineState()
 
@@ -300,21 +382,19 @@ class CaptureScraper():
             try:
                 # Position
                 m = meshes[0]
-                #m.fetchTriangle(controller)
                 indices = m.fetchIndices(controller)
                 with open("{}{:05d}-indices.bin".format(FILEPREFIX, drawcallId), 'wb') as file:
                     numpySave(indices, file)
 
-                subtimer = Timer()
                 unpacked = m.fetchData(controller)
                 with open("{}{:05d}-positions.bin".format(FILEPREFIX, drawcallId), 'wb') as file:
                     numpySave(unpacked, file)
 
                 # UV
-                if len(meshes) < 2:
+                uv_index = 2 if capture_type == "Google Earth" else 1
+                if len(meshes) <= uv_index:
                     raise Exception("No UV data")
-                m = meshes[2 if capture_type == "Google Earth" else 1]
-                #m.fetchTriangle(controller)
+                m = meshes[uv_index]
                 unpacked = m.fetchData(controller)
                 with open("{}{:05d}-uv.bin".format(FILEPREFIX, drawcallId), 'wb') as file:
                     numpySave(unpacked, file)
@@ -323,9 +403,6 @@ class CaptureScraper():
                 continue
 
             # Vertex Shader Constants
-            shader = state.GetShader(rd.ShaderStage.Vertex)
-            ep = state.GetShaderEntryPoint(rd.ShaderStage.Vertex)
-            ref = state.GetShaderReflection(rd.ShaderStage.Vertex)
             constants = self.getVertexShaderConstants(draw, state=state)
             constants["DrawCall"] = {
                 "topology": 'TRIANGLE_STRIP' if state.GetPrimitiveTopology() == rd.Topology.TriangleStrip else 'TRIANGLES',
@@ -346,14 +423,11 @@ class CaptureScraper():
 
     def extractTexture(self, drawcallId, state):
         """Save the texture in a png file (A bit dirty)"""
-        bindpoints = state.GetBindpointMapping(rd.ShaderStage.Fragment)
-        if not bindpoints.samplers:
+        rid = rdcompat.getLastReadOnlyResource(state, rd.ShaderStage.Fragment)
+        if rid is None or rid == rd.ResourceId.Null():
             print(f"Warning: No texture found for drawcall {drawcallId}")
             return
-        texture_bind = bindpoints.samplers[-1].bind
-        resources = state.GetReadOnlyResources(rd.ShaderStage.Fragment)
-        rid = resources[texture_bind].resources[0].resourceId
-    
+
         texsave = rd.TextureSave()
         texsave.resourceId = rid
         texsave.mip = 0
@@ -361,7 +435,7 @@ class CaptureScraper():
         texsave.alpha = rd.AlphaMapping.Preserve
         texsave.destType = rd.FileType.PNG
         timer = Timer()
-        controller.SaveTexture(texsave, "{}{:05d}-texture.png".format(FILEPREFIX, drawcallId))
+        self.controller.SaveTexture(texsave, "{}{:05d}-texture.png".format(FILEPREFIX, drawcallId))
         profiling_counters["SaveTexture"].add_sample(timer)
 
 def main(controller):
@@ -374,5 +448,7 @@ if __name__ == "__main__":
     else:
         print("Loading capture from {}...".format(CAPTURE_FILE))
         with CaptureWrapper(CAPTURE_FILE) as controller:
+            if controller is None:
+                print("Error: Could not open the capture file.")
+                sys.exit(1)
             main(controller)
-    

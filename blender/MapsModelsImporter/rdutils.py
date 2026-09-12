@@ -1,4 +1,4 @@
-# Copyright (c) 2019 Elie Michel
+# Copyright (c) 2019 - 2026 Elie Michel
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
 # of this software and associated documentation files (the “Software”), to deal
@@ -23,17 +23,31 @@
 
 import renderdoc as rd
 
+import rdcompat
+
 class CaptureWrapper():
+    """Open a capture file for replay, as a context manager.
+
+    Yields a ReplayController, or None if the capture could not be opened (in
+    which case the reason has been printed out).
+    """
+
     def __init__(self, filename):
         self.filename = filename
         self.err = False
-        
+        self.initialised = False
+
     def __enter__(self):
+        # Mandatory when driving RenderDoc from a plain python interpreter
+        # rather than from its own UI.
+        rdcompat.initialiseReplay()
+        self.initialised = True
+
         self.cap = rd.OpenCaptureFile()
         status = self.cap.OpenFile(self.filename, '', None)
 
         if not status.OK():
-            print("Couldn't open file: " + status.Message())
+            print("Couldn't open file: " + str(status.Message()))
             self.err = True
             return None
 
@@ -45,9 +59,9 @@ class CaptureWrapper():
         status, self.controller = self.cap.OpenCapture(rd.ReplayOptions(), None)
 
         if not status.OK():
-            print("Couldn't initialise replay: " + status.Message())
-            if status.code == 15:
-                print("This is likely due to an unsupported version of RenderDoc.")
+            print("Couldn't initialise replay: " + str(status.Message()))
+            print("This is often due to a mismatch between the version of "
+                  "RenderDoc that took the capture and the one replaying it.")
             self.cap.Shutdown()
             self.err = True
             return None
@@ -61,3 +75,5 @@ class CaptureWrapper():
     def __exit__(self, type, value, traceback):
         if not self.err:
             self.controller.Shutdown()
+        if self.initialised:
+            rdcompat.shutdownReplay()

@@ -1,0 +1,27 @@
+schema_version = "1.0.0"
+
+id = "maps_models_importer"
+version = "0.8.0"
+name = "Maps Models Importer"
+tagline = "Import 3D models from a Google Maps or Google Earth capture"
+maintainer = "Elie Michel <contact@exppad.com>"
+type = "add-on"
+
+website = "https://github.com/eliemichel/MapsModelsImporter"
+
+tags = ["Import-Export"]
+
+blender_version_min = "4.2.0"
+
+license = [
+  "SPDX:MIT",
+]
+
+copyright = [
+  "2019-2026 Elie Michel",
+]
+
+# The add-on spawns an external Python interpreter to read the RenderDoc
+# capture, and writes the extracted meshes/textures to a temporary directory.
+[permissions]
+files = "Read capture files and write extracted geometry and textures to a temporary directory"
