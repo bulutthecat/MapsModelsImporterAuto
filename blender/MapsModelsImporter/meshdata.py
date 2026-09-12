@@ -1,4 +1,4 @@
-# Copyright (c) 2019-2020 Elie Michel
+# Copyright (c) 2019 - 2026 Elie Michel
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
 # of this software and associated documentation files (the “Software”), to deal
@@ -93,13 +93,13 @@ def unpackDataNumpy(fmt, data, stride=None, count=-1):
     try:
         decoded = np.frombuffer(data, dtype, count=count)['data']
     except ValueError as err:
-        print(err)
-        print(data)
+        print(f"Could not decode vertex data: {err}")
         print(f"len(data) = {len(data)}")
         print(f"dtype = {dtype}")
         print(f"dtype.itemsize = {dtype.itemsize}")
         print(f"stride = {stride}")
         print(f"count = {count}")
+        raise
     #decoded = decoded.reshape((-1, fmt.compCount))
 
     # Post process
@@ -158,7 +158,7 @@ class MeshData(rd.MeshFormat):
             dtype = np.dtype(f"u{mesh.indexByteStride}")
             indices = np.frombuffer(ibdata, dtype=dtype, count=mesh.numIndices, offset=offset) + mesh.baseVertex
         else:
-            indices = np.range(mesh.baseVertex, mesh.baseVertex + mesh.numIndices)
+            indices = np.arange(mesh.baseVertex, mesh.baseVertex + mesh.numIndices)
 
         return indices
 

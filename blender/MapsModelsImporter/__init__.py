@@ -1,4 +1,4 @@
-# Copyright (c) 2019 - 2024 Elie Michel
+# Copyright (c) 2019 - 2026 Elie Michel
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
 # of this software and associated documentation files (the “Software”), to deal
@@ -21,34 +21,49 @@
 # This file is part of MapsModelsImporter, a set of addons to import 3D models
 # from Maps services
 
+# Blender 4.2 and above read the metadata from blender_manifest.toml instead,
+# this block is only used when the add-on is installed the legacy way.
 bl_info = {
     "name": "Maps Models Importer",
     "author": "Elie Michel",
-    "version": (0, 7, 0),
-    "blender": (4, 1, 0),
+    "version": (0, 8, 0),
+    "blender": (4, 2, 0),
     "location": "File > Import > Google Maps Capture",
     "description": "Import meshes from a Google Maps or Google Earth capture",
     "warning": "",
-    "wiki_url": "",
+    "doc_url": "https://github.com/eliemichel/MapsModelsImporter",
+    "tracker_url": "https://github.com/eliemichel/MapsModelsImporter/issues",
     "category": "Import-Export",
 }
+
+import bpy
+
+if bpy.app.version < (4, 2, 0):
+    raise RuntimeError(
+        "Maps Models Importer 0.8+ requires Blender 4.2 or above "
+        "(this is Blender {}.{}.{}). Use version 0.7.0 of the add-on for "
+        "older versions of Blender.".format(*bpy.app.version)
+    )
 
 from . import preferences
 from . import properties
 from . import operators
 from . import panels
 
+modules = (
+    preferences,
+    properties,
+    operators,
+    panels,
+)
+
 def register():
-    preferences.register()
-    properties.register()
-    operators.register()
-    panels.register()
+    for m in modules:
+        m.register()
 
 def unregister():
-    panels.unregister()
-    operators.unregister()
-    properties.unregister()
-    preferences.unregister()
+    for m in reversed(modules):
+        m.unregister()
 
 if __name__ == "__main__":
     register()

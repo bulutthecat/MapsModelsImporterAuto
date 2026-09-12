@@ -1,4 +1,4 @@
-# Copyright (c) 2019 - 2024 Elie Michel
+# Copyright (c) 2019 - 2026 Elie Michel
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
 # of this software and associated documentation files (the “Software”), to deal
@@ -21,13 +21,19 @@
 # This file is part of MapsModelsImporter, a set of addons to import 3D models
 # from Maps services
 
-import sys
 import os
+import pickle
 import subprocess
+import sys
+
+import bpy
 import numpy as np
+from bpy_extras import object_utils
+from math import pi
+from mathutils import Matrix
 
 from .profiling import Timer, profiling_counters
-from .utils import getBinaryDir, makeTmpDir
+from .utils import findPython, getRenderdocModuleDirs, makeTmpDir
 from .preferences import getPreferences
 
 SCRIPT_PATH = os.path.join(os.path.dirname(os.path.realpath(__file__)), "google_maps_rd.py")
@@ -41,8 +47,11 @@ MSG_INCORRECT_RDC = """Invalid RDC capture file. Please make sure that:
 1. You are using the recommended RenderDoc Version for this Add-on
    - RenderDoc Version 1.5 - 1.9 for MapsModelsImporter <= 0.3.2
    - RenderDoc Version = 1.10 for MapsModelsImporter >= 0.3.3 and <= 0.3.7
-   - RenderDoc Version 1.13 - 1.14 for MapsModelsImporter >= 0.4.0  and <= 0.4.2
+   - RenderDoc Version 1.13 - 1.14 for MapsModelsImporter >= 0.4.0 and <= 0.4.2
    - RenderDoc Version = 1.19 for MapsModelsImporter >= 0.5.0
+   - RenderDoc Version = 1.25 for MapsModelsImporter = 0.6.0
+   - RenderDoc Version = 1.31 for MapsModelsImporter = 0.7.0
+   - RenderDoc Version 1.31 - 1.46 for MapsModelsImporter >= 0.8.0
 2. You are importing from Google Maps or Google Earth web
 3. You were MOVING in the 3D view while taking the capture (you can use the "Capture after delay"-button in RenderDoc).
 
@@ -62,56 +71,97 @@ MSG_UNKNOWN_ERROR = "Error: An unknown Error occurred!" + MSG_CONSOLE_DEBUG_OUTP
 class MapsModelsImportError(Exception):
     pass
 
+def buildSubprocessEnv(pref, python, is_blender_python):
+    """Environment for the extraction subprocess.
+
+    Note that we deliberately do not touch os.environ: Blender's own process
+    keeps running after the import, and leaking PYTHONHOME into it breaks any
+    other add-on that spawns a python.
+    """
+    env = dict(os.environ)
+
+    if is_blender_python:
+        # Blender's interpreter needs to be told where its standard library is
+        # when started as a bare executable.
+        env["PYTHONHOME"] = os.path.dirname(os.path.dirname(python))
+        env["PATH"] = os.pathsep.join(
+            [env.get("PATH", ""), os.path.join(env["PYTHONHOME"], "bin")]
+        )
+    else:
+        # A foreign interpreter finds its own standard library; a PYTHONHOME
+        # inherited from elsewhere would only confuse it.
+        env.pop("PYTHONHOME", None)
+
+    env["PYTHONPATH"] = os.pathsep.join(
+        getRenderdocModuleDirs(pref) + [env.get("PYTHONPATH", "")]
+    ).strip(os.pathsep)
+    env["PYTHONIOENCODING"] = "utf-8"
+    return env
+
 def captureToFiles(context, filepath, prefix, max_blocks, use_experimental):
     """Extract binary files and textures from a RenderDoc capture file.
-    This spawns a standalone Python interpreter because renderdoc module cannot be loaded in embedded Python"""
+    This spawns a standalone Python interpreter because the renderdoc module
+    cannot be loaded in Blender's embedded Python."""
     pref = getPreferences(context)
-    if bpy.app.version < (2,91,0):
-        blender_dir = os.path.dirname(sys.executable)
-        blender_version = ("{0}.{1}").format(*bpy.app.version)
-        python_home = os.path.join(blender_dir, blender_version, "python")
-        python = os.path.join(python_home, "bin", "python.exe" if sys.platform == "win32" else "python3.7m") # warning: hardcoded python version for non-windows might fail with Blender update
-    else:
-        python = sys.executable
-        python_home = os.path.dirname(os.path.dirname(sys.executable))
-    os.environ["PYTHONHOME"] = python_home
-    os.environ["PYTHONPATH"] = os.environ.get("PYTHONPATH", "")
-    os.environ["PYTHONPATH"] += os.pathsep + os.path.abspath(getBinaryDir())
-    os.environ["PYTHONIOENCODING"] = "utf-8"
-    os.environ["PATH"] += os.pathsep + os.path.join(python_home, "bin")
+
+    python, explicit = findPython(pref)
+    is_blender_python = os.path.realpath(python) == os.path.realpath(sys.executable)
+    env = buildSubprocessEnv(pref, python, is_blender_python)
+
     script_path = SCRIPT_PATH_EXP if use_experimental else SCRIPT_PATH
+    command = [python, script_path, filepath, prefix, str(max_blocks)]
+
+    if pref.debug_info:
+        print(f"Running {' '.join(command)}")
+        print(f"  with PYTHONPATH = {env['PYTHONPATH']}")
+
     try:
-        out = subprocess.check_output([python, script_path, filepath, prefix, str(max_blocks)], stderr=subprocess.STDOUT, text=True)
+        out = subprocess.check_output(command, env=env, stderr=subprocess.STDOUT, text=True)
         if pref.debug_info:
             print("google_maps_rd returned:")
             print(out)
+    except OSError as err:
+        raise MapsModelsImportError(
+            f"Error: Could not run the python interpreter '{python}': {err}"
+            + MSG_CONSOLE_DEBUG_OUTPUT
+        )
     except subprocess.CalledProcessError as err:
         if pref.debug_info:
             print("\n==========================================================================================")
             print("google_maps_rd failed and returned:")
             print(err.output)
-            print(f"\nExtra info:\n - python = {python}\n - python_home = {python_home}")
+            print(f"\nExtra info:\n - python = {python}\n - PYTHONPATH = {env['PYTHONPATH']}")
         if err.returncode == 20: #error codes 20 and 21 are defined in google_maps_rd.py
-            ERROR_MESSAGE = MSG_RDMODULE_NOT_FOUND
+            ERROR_MESSAGE = MSG_RDMODULE_NOT_FOUND + describeModuleLookup(pref, python, explicit)
         elif err.returncode == 21:
-            ERROR_MESSAGE = MSG_RDMODULE_IMPORT_ERROR
+            ERROR_MESSAGE = MSG_RDMODULE_IMPORT_ERROR + describeModuleLookup(pref, python, explicit)
         elif err.returncode == 1:
             ERROR_MESSAGE = MSG_INCORRECT_RDC
             if pref.debug_info:
                 print(MSG_INCORRECT_RDC)
         else:
-            ERROR_MESSAGE = MSG_UNKNOWN_ERROR + "\nReturncode: " + err.returncode
+            ERROR_MESSAGE = MSG_UNKNOWN_ERROR + "\nReturncode: " + str(err.returncode)
         raise MapsModelsImportError(ERROR_MESSAGE)
 
-# -----------------------------------------------------------------------------
+def describeModuleLookup(pref, python, explicit):
+    """Extra hints appended to the 'module not found' errors, which are by far
+    the most common failure mode outside of Windows."""
+    lines = [
+        "",
+        f"Interpreter used: {python}" + (" (from your preferences)" if explicit else ""),
+        "Directories searched for the renderdoc module:",
+    ]
+    lines += [f"  - {d}" for d in getRenderdocModuleDirs(pref)]
+    lines += [
+        "",
+        "On Linux and macOS no renderdoc module is shipped with the add-on: it has",
+        "to be built from RenderDoc's sources. The tools/mmi script in this",
+        "repository does that for you (tools/mmi setup), then points the add-on at",
+        "the result (tools/mmi mount).",
+    ]
+    return "\n".join(lines)
 
-import bpy
-import bmesh
-import pickle
-from bpy_extras import object_utils
-from math import floor, pi
-from mathutils import Matrix
-import os
+# -----------------------------------------------------------------------------
 
 def makeMatrix(mdata):
     return Matrix([
@@ -195,31 +245,43 @@ def addMesh(context, name, verts, tris, uvs):
     mesh.from_pydata(verts, [], tris)
     mesh.update()
 
-    bm = bmesh.new()
-    bm.from_mesh(mesh)
-    uv_layer = bm.loops.layers.uv.verify()
-    for f in bm.faces:
-        for l in f.loops:
-            luv = l[uv_layer]
-            luv.uv = tuple(uvs[l.vert.index])
-    bm.to_mesh(mesh)
+    # UVs are per vertex here, but Blender stores them per face corner, so
+    # expand them through the loops' vertex indices. Doing it with foreach_get/
+    # foreach_set rather than with bmesh is roughly an order of magnitude
+    # faster, which matters because a capture holds hundreds of these meshes.
+    if len(mesh.loops) > 0:
+        loop_verts = np.empty(len(mesh.loops), dtype=np.int32)
+        mesh.loops.foreach_get("vertex_index", loop_verts)
+        uv_layer = mesh.uv_layers.new(name="UVMap")
+        uv_layer.data.foreach_set("uv", np.asarray(uvs, dtype=np.float32)[loop_verts].ravel())
+        mesh.update()
 
     obj = object_utils.object_data_add(context, mesh, operator=None)
     return obj
 
+def getPrincipledNode(mat):
+    """Look the Principled BSDF node up by type rather than by name: its name
+    is localized, so nodes["Principled BSDF"] fails whenever Blender's
+    interface is not in English."""
+    for node in mat.node_tree.nodes:
+        if node.bl_idname == "ShaderNodeBsdfPrincipled":
+            return node
+    return None
+
 def addImageMaterial(name, obj, img):
-    bpy.ops.material.new()
     mat = bpy.data.materials.new(name=name)
     mat.use_nodes = True
     obj.data.materials.append(mat)
     nodes = mat.node_tree.nodes
-    principled = nodes["Principled BSDF"]
+    principled = getPrincipledNode(mat)
+    if principled is None:
+        return
     principled.inputs["Roughness"].default_value = 1.0
     if img is not None:
         texture_node = nodes.new(type="ShaderNodeTexImage")
         texture_node.image = img
-        links = mat.node_tree.links
-        link = links.new(texture_node.outputs[0], principled.inputs[0])
+        texture_node.location = (principled.location.x - 300, principled.location.y)
+        mat.node_tree.links.new(texture_node.outputs["Color"], principled.inputs["Base Color"])
 
 def numpyLoad(file):
     (dim,) = np.fromfile(file, dtype=np.int32, count=1)
@@ -255,6 +317,30 @@ def loadData(prefix, drawcall_id):
 
 # -----------------------------------------------------------------------------
 
+def makeTriangles(indices, topology):
+    """Triangle list out of an index buffer, as a (n, 3) integer array."""
+    indices = np.asarray(indices, dtype=np.int64)
+    n = len(indices)
+
+    if topology == 'TRIANGLE_STRIP':
+        # Reversing the winding of every other triangle is what turns a strip
+        # into a list. Degenerate triangles are the standard way of stitching
+        # several strips together, so drop them.
+        if n < 4:
+            return np.empty((0, 3), dtype=np.int64)
+        i = np.arange(n - 3)
+        tris = np.stack((indices[i], indices[i + 1], indices[i + 2]), axis=1)
+        odd = (i % 2) == 1
+        tris[odd] = tris[odd][:, [0, 2, 1]]
+        keep = (
+            (tris[:, 0] != tris[:, 1])
+            & (tris[:, 0] != tris[:, 2])
+            & (tris[:, 1] != tris[:, 2])
+        )
+        return tris[keep]
+
+    return indices[: (n // 3) * 3].reshape(-1, 3)
+
 def filesToBlender(context, prefix, max_blocks=200, use_experimental=False, globalScale=1.0/256.0):
     """Import data from the files extracted by captureToFiles"""
     # Get reference matrix
@@ -284,16 +370,14 @@ def filesToBlender(context, prefix, max_blocks=200, use_experimental=False, glob
             drawcall_id += 1
             continue
         
-        timer = Timer()
-        # Make triangles from triangle strip index buffer
-        n = len(indices)
-        if constants["DrawCall"]["topology"] == 'TRIANGLE_STRIP':
-            tris = [ [ indices[i+j] for j in [[0,1,2],[0,2,1]][i%2] ] for i in range(n - 3)]
-            tris = [ t for t in tris if t[0] != t[1] and t[0] != t[2] and t[1] != t[2] ]
-        else:
-            tris = [ [ indices[3*i+j] for j in range(3) ] for i in range(n//3) ]
-
         if len(indices) == 0:
+            drawcall_id += 1
+            continue
+
+        timer = Timer()
+        tris = makeTriangles(indices, constants["DrawCall"]["topology"])
+        if len(tris) == 0:
+            drawcall_id += 1
             continue
 
         if constants["DrawCall"]["type"] == 'Google Maps':
