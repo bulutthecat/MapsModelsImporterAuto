@@ -44,9 +44,13 @@ Requirements
 * A GPU with working hardware acceleration, and an X11 session (on Wayland the
   browser is started through XWayland, which is the combination RenderDoc
   supports).
-* A browser that is **not** a snap or flatpak package. Snap confinement
-  prevents RenderDoc from hooking the process. `tools/mmi install-chrome`
-  installs Google Chrome from Google's apt repository, which is not confined.
+* A browser. `tools/mmi install-chromium` downloads a self-contained Chrome
+  (Google's "Chrome for Testing" build) into `~/.local/share/maps-models-importer`,
+  which needs no root and behaves the same on every distribution. `mmi setup`
+  does this automatically when it cannot find a usable browser.
+
+  A distribution browser works too, as long as it is **not** a snap or flatpak
+  package: their confinement prevents RenderDoc from hooking the process.
 
 Commands
 --------
@@ -64,6 +68,7 @@ Commands
 | `stop` | Ends the session |
 | `import FILE.rdc` | Imports one capture into a `.blend` with headless Blender |
 | `watch` | Imports every capture that appears in the capture directory |
+| `install-chromium` | Downloads a self-contained Chrome into `MMI_HOME`, no root needed |
 | `install-chrome` | Installs Google Chrome from Google's apt repository |
 | `env` | Prints the resolved paths |
 | `clean [captures\|output\|build\|all]` | Housekeeping |
@@ -96,6 +101,10 @@ pass `--swig-package /path/to/that.zip`.
 ```
 tools/mmi up
 ```
+
+Useful variations: `--replace` stops a browser left over from an earlier
+session, `--earth` opens Google Earth instead, and `--in-process-gpu` is the
+fallback for machines where the GPU process never gets hooked.
 
 `up` mounts the add-on into Blender (symlink + enable + configure, saved into
 your Blender preferences), then starts the browser with RenderDoc attached and
@@ -147,11 +156,26 @@ Troubleshooting
 ---------------
 
 **`doctor` says no browser is usable.** You most likely have the snap Chromium.
-Run `tools/mmi install-chrome`, or install any non-snap Chromium build.
+Run `tools/mmi install-chromium`, which downloads one that does not depend on
+your distribution at all.
 
-**The browser window opens but nothing is ever hooked.** Something reused an
-already-running browser. `mmi` passes its own `--user-data-dir` to avoid that,
-so also check that you have no `chrome://` policy forcing a single instance.
+**The browser dies immediately with `zygote_host_impl_linux.cc ... Check
+failed: No such process`.** Chromium normally forks its child processes from a
+"zygote" and then validates that process' PID through a handshake across a PID
+namespace. RenderDoc's child-process hooking breaks that handshake and the
+browser aborts. `mmi` therefore passes `--no-zygote` (and `--no-sandbox`, which
+Chromium requires alongside it), so children are forked and exec'd directly.
+If you are launching the browser by hand, you need both of those flags.
+
+**A browser from a previous session is still running.** `mmi` tells you the
+pid and refuses to start, because a second instance on the same profile would
+just hand its command line to the first one and exit. Close it, or use
+`tools/mmi up --replace`.
+
+**The browser opens but `tools/mmi status` never shows a graphics API.** The
+GPU process is not going through a path RenderDoc hooks. Try `--api gl-egl`,
+then `--api vulkan`, then `tools/mmi up --in-process-gpu`, which runs the GPU
+code inside the browser process so that no child has to be hooked at all.
 
 **The capture is empty, or the import says no relevant draw calls.** You were
 not moving in the 3D view (Google Maps), or the page is not in 3D mode. Check
@@ -183,6 +207,7 @@ variable:
 | `MMI_API` | `gl`, `gl-egl` or `vulkan` |
 | `MMI_URL` | Page to open |
 | `RENDERDOC_VERSION` | RenderDoc tag to build |
+| `CHROME_VERSION` | Chrome for Testing version installed by `install-chromium` |
 
 The add-on itself reads two environment variables, so it can be pointed at a
 RenderDoc module without going through the preferences UI:

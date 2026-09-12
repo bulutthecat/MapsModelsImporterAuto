@@ -85,6 +85,9 @@ class CaptureScraper():
     def __init__(self, controller):
         self.controller = controller
         self._uniform_names_cache = {}
+        # (events, draw calls, indexed draw calls) seen while scraping, used to
+        # explain what went wrong when nothing relevant was found.
+        self.capture_summary = None
 
     def findDrawcallBatch(self, drawcalls, first_call_prefix, drawcall_prefix, last_call_prefix):
         batch = []
@@ -313,8 +316,12 @@ class CaptureScraper():
         state of every draw call, hence its use as a last resort only."""
         print("Trying scraping strategy 'by uniform' (API agnostic)...")
 
-        candidates = [draw for draw in drawcalls if rdcompat.isIndexedDrawcall(draw)]
-        print(f"Examining {len(candidates)} indexed draw calls...")
+        all_draws = [draw for draw in drawcalls if rdcompat.isDrawcall(draw)]
+        candidates = [draw for draw in all_draws if rdcompat.isIndexedDrawcall(draw)]
+        print(
+            f"Examining {len(candidates)} indexed draw calls "
+            f"(out of {len(all_draws)} draw calls, {len(drawcalls)} events)..."
+        )
 
         per_type = {}
         for draw in candidates:
@@ -324,6 +331,7 @@ class CaptureScraper():
 
         if not per_type:
             print("Error: Could not find the beginning of the relevant 3D draw calls")
+            self.capture_summary = (len(drawcalls), len(all_draws), len(candidates))
             return [], "none"
 
         # If several services matched (they should not), go with the one that
@@ -356,9 +364,8 @@ class CaptureScraper():
 
         if not relevant_drawcalls:
             raise RuntimeError(
-                "Could not find any relevant draw call in this capture. "
-                "Please check that it was taken from Google Maps, Google Earth "
-                "or Mapy CZ, while moving in the 3D view."
+                "Could not find any relevant draw call in this capture."
+                + self.explainEmptyCapture()
             )
 
         print(f"Scraping capture from {capture_type}...")
@@ -420,6 +427,39 @@ class CaptureScraper():
         print("Profiling counters:")
         for key, counter in profiling_counters.items():
             print(f" - {key}: {counter.summary()}")
+
+    def explainEmptyCapture(self):
+        """Turn 'nothing found' into something the user can act on. What the
+        capture does contain says a lot about which step went wrong."""
+        if self.capture_summary is None:
+            return ""
+        events, draws, indexed = self.capture_summary
+
+        message = f"\nThe capture holds {events} events, {draws} draw calls, "
+        message += f"{indexed} of them indexed.\n"
+
+        if draws == 0:
+            message += (
+                "No draw call at all: the capture caught a frame in which nothing "
+                "was rendered. Take another one while the 3D view is being moved."
+            )
+        elif indexed == 0:
+            message += (
+                "None of them is indexed, which is what the map geometry uses. "
+                "This usually means the capture caught the browser compositing "
+                "its window rather than the page drawing its 3D tiles: the 3D "
+                "content is being rendered by a software fallback (SwiftShader) "
+                "that RenderDoc does not see. Check chrome://gpu to confirm that "
+                "WebGL is hardware accelerated."
+            )
+        else:
+            message += (
+                "None of them uses the uniforms Google Maps, Google Earth or "
+                "Mapy CZ declare. Make sure the page really is in 3D mode, and "
+                "that you were MOVING in the view at the moment of the capture "
+                "(Google Maps only streams its geometry while the view moves)."
+            )
+        return message
 
     def extractTexture(self, drawcallId, state):
         """Save the texture in a png file (A bit dirty)"""
