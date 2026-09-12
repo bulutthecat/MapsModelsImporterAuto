@@ -1094,7 +1094,8 @@ cmd_inspect() {
     while [ $# -gt 0 ]; do
         case "$1" in
             -h|--help) usage_inspect; return 0 ;;
-            --top|--all-constants) extra+=("$1"); shift ;;
+            --top) extra+=("$1" "$2"); shift 2 ;;
+            --all-constants|--source|--values) extra+=("$1"); shift ;;
             -*) extra+=("$1"); shift ;;
             *) if [ -z "$capture" ]; then capture="$1"; else extra+=("$1"); fi; shift ;;
         esac
@@ -1272,6 +1273,9 @@ it shows whether the 3D geometry is in there at all.
 
   --top N                   Detail the N busiest shaders (default 5)
   --all-constants           List every constant, not only matrices and vec4s
+  --values                  Show matrix/vec4 values for a few draw calls, to see
+                            which change per tile
+  --source                  Print each shader's vertex shader source
 EOF
 }
 

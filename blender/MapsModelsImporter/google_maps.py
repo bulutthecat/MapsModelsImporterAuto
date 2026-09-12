@@ -189,44 +189,137 @@ def mergeConstantBlocks(constants):
         merged.update(block)
     return merged
 
-def resolveUniformsFromHints(globUniforms, hints, uvs):
-    """Work out which constant is the model matrix and which is the UV
-    transform, when their names mean nothing to us.
+class UniformResolution:
+    """Which constants to read the model matrix and the UV transform from,
+    decided once for a whole capture.
 
-    The scraper narrows it down to the 4x4 matrices and the vec4s a shader
-    declares; picking between several vec4s is done by trying each one and
-    keeping whichever maps the mesh's UVs closest to the [0, 1] square, which
-    is where texture coordinates belong.
+    Deciding per draw call would let two tiles disagree, and worse, it cannot
+    tell a per-tile placement matrix from a camera matrix shared by every
+    tile: that difference only shows across draw calls. So the constants of
+    every draw call are looked at together first.
     """
-    matrix_candidates = [n for n in hints.get("matrix_candidates", []) if n in globUniforms]
-    uv_candidates = [n for n in hints.get("uv_candidates", []) if n in globUniforms]
+
+    def __init__(self, matrix_name, uv_name, uv_convention, layout="columns"):
+        self.matrix_name = matrix_name
+        self.uv_name = uv_name
+        self.uv_convention = uv_convention
+        # "columns": the 16 values are the matrix's columns, as HLSL's
+        # mul(pos, M) convention delivers them; makeMatrix transposes those.
+        # "rows": they are its rows, as a GLSL M * pos shader delivers them.
+        self.layout = layout
+
+    def apply(self, globUniforms):
+        if self.matrix_name not in globUniforms or self.uv_name not in globUniforms:
+            return None, None
+        matrix = matrixFromValues(globUniforms[self.matrix_name], self.layout)
+        offsetScale = uvConvention(globUniforms[self.uv_name], self.uv_convention)
+        return offsetScale, matrix
+
+
+def matrixFromValues(values, layout):
+    if layout == "rows":
+        return Matrix([values[0:4], values[4:8], values[8:12], values[12:16]])
+    return makeMatrix(values)
+
+
+def resolveUniformsAcrossCapture(all_constants, all_uvs):
+    """Pick the matrix and the UV transform for a capture whose uniform names
+    mean nothing to us, from what the scraper narrowed them down to and from
+    how their values behave across the draw calls.
+
+    all_constants: list of the constants dictionaries, one per draw call
+    all_uvs: matching list of raw UV arrays (or None)
+    """
+    hints = None
+    for constants in all_constants:
+        hints = constants.get("DrawCall", {}).get("uniform_hints")
+        if hints:
+            break
+    if not hints:
+        return None
+
+    blocks = [mergeConstantBlocks(c) for c in all_constants]
+    matrix_candidates = [n for n in hints.get("matrix_candidates", []) if n in blocks[0]]
+    uv_candidates = [n for n in hints.get("uv_candidates", []) if n in blocks[0]]
     if not matrix_candidates or not uv_candidates:
-        return None, None
+        return None
 
-    matrix = makeMatrix(globUniforms[matrix_candidates[0]])
+    # The placement matrix is the one that differs between tiles. A matrix
+    # identical in every draw call is the camera, and using it would put
+    # every tile in the same place.
+    def varies(name):
+        values = {tuple(round(float(x), 6) for x in b[name]) for b in blocks if name in b}
+        return len(values) > 1
 
+    varying = [n for n in matrix_candidates if varies(n)]
+    if varying:
+        matrix_name = varying[0]
+    else:
+        matrix_name = matrix_candidates[0]
+        print("WARNING: no matrix differs between draw calls; the tile placement is not")
+        print("in a matrix and every tile will land on the same spot. Run")
+        print("`tools/mmi inspect --source` on this capture and report the vertex shader.")
+
+    # Rows or columns? Start from the API's convention (HLSL multiplies row
+    # vectors, GLSL column vectors), then let the data overrule it: a
+    # placement matrix is affine, so whichever reading puts (0, 0, 0, 1) in
+    # the bottom row is the right one. The identity is affine both ways and
+    # says nothing, hence looking at several tiles rather than the first.
+    api = all_constants[0].get("DrawCall", {}).get("api", "unknown")
+    layout = "columns" if api.startswith("D3D") else "rows"
+    votes = {"rows": 0, "columns": 0}
+    for block in blocks[:32]:
+        if matrix_name not in block:
+            continue
+        as_rows = matrixFromValues(block[matrix_name], "rows")
+        as_columns = matrixFromValues(block[matrix_name], "columns")
+        if isAffine(as_rows) and not isAffine(as_columns):
+            votes["rows"] += 1
+        elif isAffine(as_columns) and not isAffine(as_rows):
+            votes["columns"] += 1
+    if votes["rows"] != votes["columns"]:
+        layout = "rows" if votes["rows"] > votes["columns"] else "columns"
+    print(f"Matrix layout: {layout} (capture API {api}, affine votes {votes})")
+
+    # The UV transform: whichever vec4, under either known convention, maps
+    # the UVs of the tiles closest to the [0, 1] square. Judged over several
+    # tiles so that one odd tile cannot decide it.
     best = None
     for name in uv_candidates:
-        value = globUniforms[name]
-        if len(value) < 4:
-            continue
         for convention in ("direct", "flipped"):
-            offsetScale = uvConvention(value, convention)
-            if offsetScale is None:
+            score = 0.0
+            considered = 0
+            for block, uvs in zip(blocks, all_uvs):
+                if name not in block or uvs is None or len(block[name]) < 4:
+                    continue
+                offsetScale = uvConvention(block[name], convention)
+                if offsetScale is None:
+                    continue
+                score += scoreUvTransform(uvs, offsetScale)
+                considered += 1
+                if considered >= 16:
+                    break
+            if considered == 0:
                 continue
-            score = scoreUvTransform(uvs, offsetScale)
-            # Ties go to whichever was tried first, i.e. the plain
-            # interpretation, so the result does not depend on rounding.
+            score /= considered
             if best is None or score < best[0] - 1e-6:
-                best = (score, offsetScale, name, convention)
+                best = (score, name, convention)
 
     if best is None:
-        return None, None
+        return None
+    score, uv_name, convention = best
 
-    score, offsetScale, name, convention = best
-    print(f"Using '{matrix_candidates[0]}' as the model matrix and '{name}' "
-          f"({convention}) as the UV transform")
-    return offsetScale, matrix
+    print(f"Using '{matrix_name}' as the model matrix"
+          + (" (per-tile)" if varying else " (shared by all tiles!)")
+          + f" and '{uv_name}' ({convention}) as the UV transform")
+    return UniformResolution(matrix_name, uv_name, convention, layout)
+
+
+def isAffine(matrix, tolerance=1e-4):
+    row = matrix[3]
+    return (abs(row[0]) < tolerance and abs(row[1]) < tolerance
+            and abs(row[2]) < tolerance and abs(row[3] - 1.0) < tolerance)
+
 
 def uvConvention(value, convention):
     """The two ways the UV offset/scale vec4 has been seen to be laid out."""
@@ -256,7 +349,7 @@ def scoreUvTransform(uvs, offsetScale):
         + np.abs(transformed.min())
     )
 
-def extractUniforms(constants, refMatrix, uvs=None):
+def extractUniforms(constants, refMatrix, uvs=None, resolution=None):
     """Extract from constant buffer the model matrix and uv offset
     The reference matrix is used to cancel the view part of teh modelview matrix
     """
@@ -306,12 +399,11 @@ def extractUniforms(constants, refMatrix, uvs=None):
             ) @ Matrix.Scale(500, 4)
         """
     else:
-        # Nothing we recognise by name. The scraper may still have worked out
-        # which constants matter from the shape of the shader.
-        hints = constants.get("DrawCall", {}).get("uniform_hints")
+        # Nothing we recognise by name. Fall back on the capture-wide
+        # resolution worked out from the scraper's hints.
         uvOffsetScale, matrix = (None, None)
-        if hints:
-            uvOffsetScale, matrix = resolveUniformsFromHints(globUniforms, hints, uvs)
+        if resolution is not None:
+            uvOffsetScale, matrix = resolution.apply(globUniforms)
 
         if uvOffsetScale is None:
             if refMatrix is None:
@@ -434,6 +526,34 @@ def makeTriangles(indices, topology):
 
     return indices[: (n // 3) * 3].reshape(-1, 3)
 
+def resolveUniformsForCapture(prefix, max_blocks):
+    """Pre-pass over the extracted constants (and a few UV buffers) to settle
+    the matrix/UV choice before any geometry is built. Only matters when the
+    uniforms are not recognised by name; cheap either way, the constants
+    files are tiny."""
+    all_constants = []
+    all_uvs = []
+    for drawcall_id in range(max_blocks):
+        path = "{}{:05d}-constants.bin".format(prefix, drawcall_id)
+        if not os.path.isfile(path):
+            continue
+        with open(path, 'rb') as file:
+            constants = pickle.load(file)
+        all_constants.append(constants)
+        uvs = None
+        if len(all_uvs) < 16:
+            uv_path = "{}{:05d}-uv.bin".format(prefix, drawcall_id)
+            if os.path.isfile(uv_path):
+                with open(uv_path, 'rb') as file:
+                    uvs = numpyLoad(file)
+        all_uvs.append(uvs)
+
+    if not all_constants:
+        return None
+    if not all_constants[0].get("DrawCall", {}).get("uniform_hints"):
+        return None
+    return resolveUniformsAcrossCapture(all_constants, all_uvs)
+
 def filesToBlender(context, prefix, max_blocks=200, use_experimental=False, globalScale=1.0/256.0):
     """Import data from the files extracted by captureToFiles"""
     # Get reference matrix
@@ -442,6 +562,8 @@ def filesToBlender(context, prefix, max_blocks=200, use_experimental=False, glob
     if max_blocks <= 0:
         # If no specific bound, max block is the number of .bin files in the directory
         max_blocks = len([file for file in os.listdir(os.path.dirname(prefix)) if file.endswith(".bin")])
+
+    resolution = resolveUniformsForCapture(prefix, max_blocks)
 
     drawcall_id = 0
     while drawcall_id < max_blocks:
@@ -458,7 +580,7 @@ def filesToBlender(context, prefix, max_blocks=200, use_experimental=False, glob
             continue
         profiling_counters["loadData"].add_sample(timer)
 
-        uvOffsetScale, matrix, refMatrix = extractUniforms(constants, refMatrix, uvs)
+        uvOffsetScale, matrix, refMatrix = extractUniforms(constants, refMatrix, uvs, resolution)
         if uvOffsetScale is None:
             drawcall_id += 1
             continue

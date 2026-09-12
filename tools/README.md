@@ -208,6 +208,27 @@ If the geometry imports but the textures look flipped vertically, that choice
 picked the wrong one of the two UV conventions; say so in an issue with the
 output of `tools/mmi inspect` and it can be pinned down.
 
+**Every tile lands on the same spot -- one heap of giant planes collapsing into
+each other.** Two causes, both now handled, and the import log tells you which
+one applied:
+
+* *The matrix layout.* An HLSL shader multiplies row vectors (`mul(pos, M)`),
+  a GLSL one column vectors (`M * pos`), so the same 16 numbers describe
+  transposed matrices. The importer was written for D3D11 captures and read
+  every matrix the HLSL way; on a GL capture that puts the tile's translation
+  where Blender ignores it, and every tile ends up at the origin. The layout
+  is now decided per capture: from the capture's API, then confirmed by the
+  data (a placement matrix is affine, so only one reading has `0 0 0 1` as its
+  bottom row). The log prints `Matrix layout: rows/columns (capture API ...,
+  affine votes ...)`.
+* *The wrong matrix.* A shader may hold both a per-tile placement matrix and a
+  camera matrix shared by every tile; picking the shared one places every
+  tile identically. The scraper and importer now prefer the matrix whose
+  value **changes between draw calls**, and the log says `(per-tile)` or
+  `(shared by all tiles!)` next to the one it chose. If it is the shared one,
+  the placement is not in a matrix at all -- run `tools/mmi inspect --values
+  --source` and report the vertex shader.
+
 **The browser opens but `tools/mmi status` never shows a graphics API.** The
 GPU process is not going through a path RenderDoc hooks. Try `--api gl-egl`,
 then `--api vulkan`, then `tools/mmi up --in-process-gpu`, which runs the GPU

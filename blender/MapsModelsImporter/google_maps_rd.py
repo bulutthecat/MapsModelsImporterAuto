@@ -95,6 +95,17 @@ def hasPositionAndUV(attributes):
     counts = [count for _, count in attributes]
     return len(counts) >= 2 and any(c >= 3 for c in counts) and any(c == 2 for c in counts)
 
+def captureApi(state):
+    """Which graphics API the capture was taken with. It matters for matrices:
+    HLSL shaders multiply row vectors (mul(pos, M)), GLSL ones column vectors
+    (M * pos), so the same 16 numbers mean transposed things."""
+    for name, check in (("GL", "IsCaptureGL"), ("VK", "IsCaptureVK"),
+                        ("D3D11", "IsCaptureD3D11"), ("D3D12", "IsCaptureD3D12")):
+        probe = getattr(state, check, None)
+        if probe is not None and probe():
+            return name
+    return "unknown"
+
 def numpySave(array, file):
     np.array([array.ndim], dtype=np.int32).tofile(file)
     np.array(array.shape, dtype=np.int32).tofile(file)
@@ -429,29 +440,87 @@ class CaptureScraper():
                 continue
             if not hasPositionAndUV(signature["attributes"]):
                 continue
-            scored.append((len(entries), shader, entries, matrices, vectors, signature))
+
+            # Which of those constants actually change from one draw call to
+            # the next? A per-tile placement matrix has to; a camera or
+            # projection matrix shared by every tile does not. This is what
+            # separates the terrain shader from anything else that also
+            # happens to take a matrix, a vec4, a position and a UV -- roads,
+            # labels, the browser's own quads -- and, within the terrain
+            # shader, the matrix that places the tile from the one that
+            # merely projects it. Sampling a handful of draws is enough.
+            varying = self.findVaryingConstants([draw for draw, _ in entries])
+            varying_matrices = [m for m in matrices if m in varying]
+            varying_vectors = [v for v in vectors if v in varying]
+            scored.append({
+                "count": len(entries),
+                "shader": shader,
+                "entries": entries,
+                "matrices": varying_matrices + [m for m in matrices if m not in varying],
+                "vectors": varying_vectors + [v for v in vectors if v not in varying],
+                "varying_matrices": varying_matrices,
+                "signature": signature,
+            })
 
         if not scored:
             print("No shader looks like it draws textured 3D tiles.")
             return [], "none"
 
-        # The tiles dominate the frame; anything else drawing through a matrix
-        # (the browser's own UI, an overlay) is a handful of calls.
-        scored.sort(key=lambda entry: entry[0], reverse=True)
-        count, shader, entries, matrices, vectors, signature = scored[0]
+        # Best: a shader whose matrix changes per draw call, used by the most
+        # draw calls. A shader whose matrix is the same for every call cannot
+        # be placing tiles with it, however many calls it makes.
+        scored.sort(key=lambda g: (bool(g["varying_matrices"]), g["count"]), reverse=True)
 
+        print("Candidate shaders (draw calls, per-draw matrices / shared matrices):")
+        for group in scored[:6]:
+            shared = [m for m in group["matrices"] if m not in group["varying_matrices"]]
+            print(f"  - {group['shader']}: {group['count']} calls, "
+                  f"varying {group['varying_matrices'] or 'none'}, shared {shared or 'none'}")
+
+        chosen = scored[0]
+        signature = chosen["signature"]
         angle = isAngleWebglShader(name for name, _, _ in signature["constants"])
-        print(f"Picked shader {shader} used by {count} indexed draw calls.")
-        print(f"  matrix candidates: {matrices}")
-        print(f"  uv candidates: {vectors}")
+        print(f"Picked shader {chosen['shader']} used by {chosen['count']} indexed draw calls.")
+        print(f"  matrix candidates: {chosen['matrices']}")
+        print(f"  uv candidates: {chosen['vectors']}")
         if angle:
             print("  (its uniform names are ANGLE hashes, as Chrome's WebGL produces)")
+        if not chosen["varying_matrices"]:
+            print("  WARNING: none of its matrices changes between draw calls, so the tile")
+            print("  placement is not in a matrix. The import will pile every tile onto the")
+            print("  same spot. Run `tools/mmi inspect --source` on this capture and report")
+            print("  the vertex shader, so that the actual placement formula can be added.")
 
         self.uniform_hints = {
-            "matrix_candidates": matrices,
-            "uv_candidates": vectors,
+            "matrix_candidates": chosen["matrices"],
+            "uv_candidates": chosen["vectors"],
+            "varying_matrices": chosen["varying_matrices"],
         }
-        return [draw for draw, _ in entries], "Google Maps"
+        return [draw for draw, _ in chosen["entries"]], "Google Maps"
+
+    def findVaryingConstants(self, draws, samples=8):
+        """Names of the constants whose values differ between draw calls, judged
+        on a spread of up to `samples` of them."""
+        if len(draws) < 2:
+            return set()
+        step = max(1, len(draws) // samples)
+        picked = draws[::step][:samples]
+        if len(picked) < 2:
+            picked = draws[:2]
+
+        seen = {}
+        for draw in picked:
+            constants = self.getVertexShaderConstants(draw)
+            for block in constants.values():
+                if not isinstance(block, dict):
+                    continue
+                for name, value in block.items():
+                    try:
+                        key = tuple(round(float(v), 6) for v in value)
+                    except (TypeError, ValueError):
+                        key = repr(value)
+                    seen.setdefault(name, set()).add(key)
+        return {name for name, values in seen.items() if len(values) > 1}
 
     def consolidateEvents(self, rootList, accumulator=None):
         if accumulator is None:
@@ -490,9 +559,13 @@ class CaptureScraper():
             signature = self.getVertexShaderSignature(relevant_drawcalls[0])
             matrices, vectors = classifyConstants(signature["constants"])
             if matrices and vectors:
+                varying = self.findVaryingConstants(relevant_drawcalls)
                 self.uniform_hints = {
-                    "matrix_candidates": matrices,
-                    "uv_candidates": vectors,
+                    "matrix_candidates": [m for m in matrices if m in varying]
+                                         + [m for m in matrices if m not in varying],
+                    "uv_candidates": [v for v in vectors if v in varying]
+                                     + [v for v in vectors if v not in varying],
+                    "varying_matrices": [m for m in matrices if m in varying],
                 }
 
         if MAX_BLOCKS <= 0:
@@ -540,6 +613,7 @@ class CaptureScraper():
                 "topology": 'TRIANGLE_STRIP' if state.GetPrimitiveTopology() == rd.Topology.TriangleStrip else 'TRIANGLES',
                 "type": capture_type,
                 "uniform_hints": self.uniform_hints,
+                "api": captureApi(state),
             }
             with open("{}{:05d}-constants.bin".format(FILEPREFIX, drawcallId), 'wb') as file:
                 pickle.dump(constants, file)

@@ -50,9 +50,16 @@ except ImportError as err:  # pragma: no cover - depends on the environment
     sys.stderr.write(f"Could not import the renderdoc python module: {err}\n")
     sys.exit(20)
 
+# google_maps_rd.py is a script first and a module second: it reads its
+# arguments at import time. Give it a harmless set before importing it.
+_REAL_ARGV = sys.argv
+sys.argv = [_REAL_ARGV[0], "", "", "-1"]
+
 import rdcompat
 from rdcompat import Drawcall
 from rdutils import CaptureWrapper
+from google_maps_rd import CaptureScraper
+sys.argv = _REAL_ARGV
 
 
 def collectActions(controller, roots, accumulator=None):
@@ -81,6 +88,34 @@ def describe(controller, draw):
     return str(state.GetShader(rd.ShaderStage.Vertex)), constants, attributes, textures
 
 
+def shaderSource(reflection):
+    if reflection is None:
+        return ""
+    return "\n".join(f.contents for f in reflection.debugInfo.files)
+
+
+def sampleValues(scraper, draws, names, samples=3):
+    """Values of the named constants over a few draw calls, to show which of
+    them change from one tile to the next."""
+    step = max(1, len(draws) // samples)
+    rows = []
+    for draw in draws[::step][:samples]:
+        constants = scraper.getVertexShaderConstants(draw)
+        merged = {}
+        for block in constants.values():
+            if isinstance(block, dict):
+                merged.update(block)
+        rows.append({n: merged.get(n) for n in names})
+    return rows
+
+
+def fmt(values, limit=16):
+    if values is None:
+        return "?"
+    vals = list(values)[:limit]
+    return "[" + ", ".join(f"{v:.6g}" for v in vals) + ("]" if len(values) <= limit else ", ...]")
+
+
 def main(argv):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("capture", help="The .rdc file to inspect")
@@ -88,6 +123,10 @@ def main(argv):
                         help="How many of the busiest shaders to detail")
     parser.add_argument("--all-constants", action="store_true",
                         help="Print every constant, not just the matrices and vec4s")
+    parser.add_argument("--source", action="store_true",
+                        help="Print the vertex shader source of each detailed shader")
+    parser.add_argument("--values", action="store_true",
+                        help="Print the matrix and vec4 values for a few draw calls per shader")
     args = parser.parse_args(argv)
 
     with CaptureWrapper(args.capture) as controller:
@@ -117,15 +156,17 @@ def main(argv):
             return 2
 
         print(f"Grouping {len(indexed)} indexed draw calls by vertex shader...")
+        scraper = CaptureScraper(controller)
         groups = {}
         for draw in indexed:
             shader, constants, attributes, textures = describe(controller, draw)
             entry = groups.setdefault(
                 shader,
                 {"count": 0, "constants": constants, "attributes": attributes,
-                 "textures": textures},
+                 "textures": textures, "draws": [], "reflection": None},
             )
             entry["count"] += 1
+            entry["draws"].append(draw)
 
         ordered = sorted(groups.items(), key=lambda kv: -kv[1]["count"])
         print(f"{len(ordered)} distinct vertex shaders.\n")
@@ -151,6 +192,27 @@ def main(argv):
                     print(f"    {block}.{name}: {rows}x{columns}")
             looks_right = bool(matrices) and bool(vectors) and len(entry["attributes"]) >= 2
             print(f"  looks like textured 3D tiles: {'yes' if looks_right else 'no'}")
+
+            if looks_right:
+                varying = scraper.findVaryingConstants(entry["draws"])
+                print("  constants that change between draw calls: "
+                      + (", ".join(sorted(varying)) or "none"))
+                print("  matrices changing per draw (the tile placement lives here): "
+                      + (", ".join(n for _, n in matrices if n in varying) or "NONE"))
+
+            if args.values and looks_right:
+                names = [n for _, n in matrices] + [n for _, n in vectors]
+                for i, row in enumerate(sampleValues(scraper, entry["draws"], names)):
+                    print(f"  sample draw #{i}:")
+                    for name in names:
+                        print(f"    {name} = {fmt(row[name])}")
+
+            if args.source:
+                controller.SetFrameEvent(entry["draws"][0].eventId, False)
+                state = controller.GetPipelineState()
+                source = shaderSource(state.GetShaderReflection(rd.ShaderStage.Vertex))
+                print("  vertex shader source:")
+                print("    " + "\n    ".join(source.splitlines()) if source else "    (not available)")
             print()
 
     return 0
