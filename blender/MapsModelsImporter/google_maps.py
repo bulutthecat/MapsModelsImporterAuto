@@ -171,13 +171,98 @@ def makeMatrix(mdata):
         mdata[12:16]
     ]).transposed()
 
-def extractUniforms(constants, refMatrix):
+def mergeConstantBlocks(constants):
+    """All the shader's constants in one dictionary.
+
+    They normally live in the pseudo-block '$Globals', but a shader that uses a
+    real uniform buffer puts them somewhere else, and ANGLE-translated WebGL
+    does exactly that often enough to matter. Looking in every block costs
+    nothing and removes a whole class of "KeyError: $Globals".
+    """
+    if '$Globals' in constants and len(constants) <= 2:
+        return constants['$Globals']
+
+    merged = {}
+    for name, block in constants.items():
+        if name == "DrawCall" or not isinstance(block, dict):
+            continue
+        merged.update(block)
+    return merged
+
+def resolveUniformsFromHints(globUniforms, hints, uvs):
+    """Work out which constant is the model matrix and which is the UV
+    transform, when their names mean nothing to us.
+
+    The scraper narrows it down to the 4x4 matrices and the vec4s a shader
+    declares; picking between several vec4s is done by trying each one and
+    keeping whichever maps the mesh's UVs closest to the [0, 1] square, which
+    is where texture coordinates belong.
+    """
+    matrix_candidates = [n for n in hints.get("matrix_candidates", []) if n in globUniforms]
+    uv_candidates = [n for n in hints.get("uv_candidates", []) if n in globUniforms]
+    if not matrix_candidates or not uv_candidates:
+        return None, None
+
+    matrix = makeMatrix(globUniforms[matrix_candidates[0]])
+
+    best = None
+    for name in uv_candidates:
+        value = globUniforms[name]
+        if len(value) < 4:
+            continue
+        for convention in ("direct", "flipped"):
+            offsetScale = uvConvention(value, convention)
+            if offsetScale is None:
+                continue
+            score = scoreUvTransform(uvs, offsetScale)
+            # Ties go to whichever was tried first, i.e. the plain
+            # interpretation, so the result does not depend on rounding.
+            if best is None or score < best[0] - 1e-6:
+                best = (score, offsetScale, name, convention)
+
+    if best is None:
+        return None, None
+
+    score, offsetScale, name, convention = best
+    print(f"Using '{matrix_candidates[0]}' as the model matrix and '{name}' "
+          f"({convention}) as the UV transform")
+    return offsetScale, matrix
+
+def uvConvention(value, convention):
+    """The two ways the UV offset/scale vec4 has been seen to be laid out."""
+    ou, ov, su, sv = value[:4]
+    if convention == "direct":
+        return [ou, ov, su, sv]
+    # The variant the '_w' and '_webgl_*' shaders use, with the V axis flipped.
+    if sv == 0.0:
+        return None
+    return [ou, ov - 1.0 / sv, su, -sv]
+
+def scoreUvTransform(uvs, offsetScale):
+    """How far the transformed UVs fall outside [0, 1]. Lower is better."""
+    if uvs is None or len(uvs) == 0:
+        return 0.0
+    ou, ov, su, sv = offsetScale
+    sample = np.asarray(uvs, dtype=np.float64)
+    if sample.ndim != 2 or sample.shape[1] < 2:
+        return 0.0
+    sample = sample[:1024, :2]
+    transformed = (sample * 65535.0 + 0.5 + np.array([ou, ov])) * np.array([su, sv])
+    if not np.all(np.isfinite(transformed)):
+        return float('inf')
+    return float(
+        np.abs(np.clip(transformed, 0.0, 1.0) - transformed).mean()
+        + np.abs(transformed.max() - 1.0)
+        + np.abs(transformed.min())
+    )
+
+def extractUniforms(constants, refMatrix, uvs=None):
     """Extract from constant buffer the model matrix and uv offset
     The reference matrix is used to cancel the view part of teh modelview matrix
     """
 
     # Extract constants, which have different names depending on the browser/GPU driver
-    globUniforms = constants['$Globals']
+    globUniforms = mergeConstantBlocks(constants)
     postMatrix = None
     if '_w' in globUniforms and '_s' in globUniforms:
         [ou, ov, su, sv] = globUniforms['_w']
@@ -221,13 +306,21 @@ def extractUniforms(constants, refMatrix):
             ) @ Matrix.Scale(500, 4)
         """
     else:
-        if refMatrix is None:
-            print("globUniforms:")
-            for k, v in globUniforms.items():
-                print("  {}: {}".format(k, v))
-            raise MapsModelsImportError(MSG_INCORRECT_RDC)
-        else:
-            return None, None, None
+        # Nothing we recognise by name. The scraper may still have worked out
+        # which constants matter from the shape of the shader.
+        hints = constants.get("DrawCall", {}).get("uniform_hints")
+        uvOffsetScale, matrix = (None, None)
+        if hints:
+            uvOffsetScale, matrix = resolveUniformsFromHints(globUniforms, hints, uvs)
+
+        if uvOffsetScale is None:
+            if refMatrix is None:
+                print("globUniforms:")
+                for k, v in globUniforms.items():
+                    print("  {}: {}".format(k, v))
+                raise MapsModelsImportError(MSG_INCORRECT_RDC)
+            else:
+                return None, None, None
     
     if refMatrix is None:
         # Rotate around Y because Google Maps uses X as up axis
@@ -365,7 +458,7 @@ def filesToBlender(context, prefix, max_blocks=200, use_experimental=False, glob
             continue
         profiling_counters["loadData"].add_sample(timer)
 
-        uvOffsetScale, matrix, refMatrix = extractUniforms(constants, refMatrix)
+        uvOffsetScale, matrix, refMatrix = extractUniforms(constants, refMatrix, uvs)
         if uvOffsetScale is None:
             drawcall_id += 1
             continue
