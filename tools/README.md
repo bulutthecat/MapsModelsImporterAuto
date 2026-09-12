@@ -238,11 +238,20 @@ textures by size and format, saves the best one, and checks the PNG is not a
 flat colour before accepting it (a real tile does not compress to a few
 hundred bytes; a black one does), moving on to the next candidate otherwise.
 Alpha is discarded on save: an unused, all-zero alpha channel used to make the
-whole texture transparent, which Blender shows as black. The import log
-reports the choice (`Texture choice for drawcall 0: bound slot N of M,
-256x256 R8G8B8A8_UNORM, 61234 bytes`) and a summary (`Textures: N saved, N
-blank, N draw calls without one`). If it still comes out black, run
-`tools/mmi inspect --textures` and report what the shader binds.
+whole texture transparent, which Blender shows as black.
+
+More to the point for Google Maps: its tiles are **BC1 (DXT1) compressed**,
+and on an OpenGL replay RenderDoc's `SaveTexture()` reports success for such
+a texture and writes an image of the right size that is entirely black --
+every PNG comes out a few hundred bytes -- while `GetTextureData()` returns
+the compressed blocks intact. So BC1/BC2/BC3 textures are now decoded by the
+add-on itself (`bcdecode.py`, numpy only) from the raw bytes, and written as
+PNG directly. The import log reports which path wrote each texture
+(`Texture choice for drawcall 0: bound slot 0 of 1, 256x512 BC1_UNORM, 61234
+bytes, written by decoded`) and ends with `Textures: N saved, N blank, N draw
+calls without one`. `tools/mmi inspect --textures` now also says whether the
+capture holds any data for each bound texture, which separates "RenderDoc
+could not convert it" (fixed) from "it was never captured".
 
 **The browser opens but `tools/mmi status` never shows a graphics API.** The
 GPU process is not going through a path RenderDoc hooks. Try `--api gl-egl`,

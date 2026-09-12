@@ -217,8 +217,13 @@ def main(argv):
                     if desc is None:
                         print(f"    slot {position}: {rid} (no description)")
                         continue
+                    raw = controller.GetTextureData(rid, rd.Subresource(0, 0, 0))
+                    nonzero = sum(1 for b in raw[:65536] if b)
                     print(f"    slot {position}: {desc.width}x{desc.height} {desc.format.Name()}"
-                          f" {desc.type} mips={desc.mips} array={desc.arraysize}")
+                          f" {desc.type} mips={desc.mips} array={desc.arraysize};"
+                          f" raw data {len(raw)} bytes, {nonzero} of the first {min(len(raw), 65536)} non-zero")
+                    if nonzero == 0:
+                        print("      -> the capture holds no data for this texture at all")
 
             if args.source:
                 controller.SetFrameEvent(entry["draws"][0].eventId, False)

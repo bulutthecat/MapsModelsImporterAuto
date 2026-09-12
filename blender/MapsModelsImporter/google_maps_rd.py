@@ -57,6 +57,7 @@ except ImportError as err:
     print("Error Message: ", err,"\n")
     sys.exit(21)
 
+import bcdecode
 import rdcompat
 from rdcompat import Drawcall
 from meshdata import MeshData, makeMeshData
@@ -127,6 +128,7 @@ class CaptureScraper():
         self.uniform_hints = None
         self._textures = None
         self.texture_report = {"saved": 0, "missing": 0, "blank": 0, "choices": set()}
+        self.capture_api = "unknown"
         # (events, draw calls, indexed draw calls) seen while scraping, used to
         # explain what went wrong when nothing relevant was found.
         self.capture_summary = None
@@ -583,6 +585,7 @@ class CaptureScraper():
 
             controller.SetFrameEvent(draw.eventId, True)
             state = controller.GetPipelineState()
+            self.capture_api = captureApi(state)
 
             ib = state.GetIBuffer()
             vbs = state.GetVBuffers()
@@ -720,6 +723,15 @@ class CaptureScraper():
 
         path = "{}{:05d}-texture.png".format(FILEPREFIX, drawcallId)
         for area, position, rid, desc in candidates:
+            # Compressed textures first go through our own decoder: on an
+            # OpenGL replay RenderDoc's SaveTexture() reports success for a
+            # BC1 texture and writes a black image, while the compressed
+            # blocks it hands back are perfectly fine.
+            if self.decodeTextureOurselves(rid, desc, path):
+                size = os.path.getsize(path)
+                self.reportTexture(drawcallId, rid, desc, size, position, len(candidates), "decoded")
+                return
+
             texsave = rd.TextureSave()
             texsave.resourceId = rid
             texsave.mip = 0
@@ -739,20 +751,67 @@ class CaptureScraper():
             size = os.path.getsize(path) if os.path.isfile(path) else 0
             threshold = MIN_TEXTURE_BYTES
             if desc is not None:
-                # A tiny texture cannot be expected to weigh much.
-                threshold = min(MIN_TEXTURE_BYTES, 16 * desc.width * desc.height)
+                # A tiny texture cannot be expected to weigh much: a genuine
+                # 4x4 image is under a hundred bytes of PNG.
+                threshold = min(MIN_TEXTURE_BYTES, 4 * desc.width * desc.height)
             if ok and size >= threshold:
-                self.reportTexture(drawcallId, rid, desc, size, position, len(candidates))
+                self.reportTexture(drawcallId, rid, desc, size, position, len(candidates), "RenderDoc")
                 return
             print(f"  texture {rid} for drawcall {drawcallId} looks blank "
                   f"({size} bytes{'' if ok else ', save failed'}), trying another")
+            # Last chance for this candidate: read the raw bytes and convert
+            # them ourselves, in case it is the save that failed and not the
+            # data.
+            if self.decodeTextureOurselves(rid, desc, path, force=True):
+                size = os.path.getsize(path)
+                if size >= threshold:
+                    self.reportTexture(drawcallId, rid, desc, size, position, len(candidates), "decoded")
+                    return
 
         self.texture_report["blank"] += 1
         # Leave the last attempt in place rather than nothing at all.
 
-    def reportTexture(self, drawcallId, rid, desc, size, position, count):
+    def decodeTextureOurselves(self, rid, desc, path, force=False):
+        """Write the texture as a PNG from its raw bytes. Returns False when
+        the format is not one we decode, or (unless forced) when RenderDoc
+        can be trusted with it."""
+        if desc is None:
+            return False
+        fmt = desc.format
+        kind = getattr(fmt, "type", None)
+        compressed = kind in (rd.ResourceFormatType.BC1, rd.ResourceFormatType.BC2,
+                              rd.ResourceFormatType.BC3)
+        plain = (kind == rd.ResourceFormatType.Regular and fmt.compByteWidth == 1
+                 and fmt.compCount in (1, 2, 3, 4))
+        if not compressed and not (force and plain):
+            return False
+
+        try:
+            raw = self.controller.GetTextureData(rid, rd.Subresource(0, 0, 0))
+            if kind == rd.ResourceFormatType.BC1:
+                image = bcdecode.decodeBC1(raw, desc.width, desc.height)
+            elif kind == rd.ResourceFormatType.BC2:
+                image = bcdecode.decodeBC2(raw, desc.width, desc.height)
+            elif kind == rd.ResourceFormatType.BC3:
+                image = bcdecode.decodeBC3(raw, desc.width, desc.height)
+            else:
+                image = bcdecode.decodeRGBA8(raw, desc.width, desc.height,
+                                             fmt.compCount, fmt.BGRAOrder())
+        except (ValueError, RuntimeError) as err:
+            print(f"  could not decode {fmt.Name()} texture {rid} ourselves: {err}")
+            return False
+
+        # RenderDoc writes OpenGL textures top row first, as PNGs are; the raw
+        # bytes come in OpenGL's own order, bottom row first. Match RenderDoc,
+        # which is what the UVs were tuned against.
+        if self.capture_api in ("GL", "GLES"):
+            image = image[::-1]
+        bcdecode.writePNG(path, image)
+        return True
+
+    def reportTexture(self, drawcallId, rid, desc, size, position, count, how):
         self.texture_report["saved"] += 1
-        key = (position, count)
+        key = (position, count, how)
         if key in self.texture_report["choices"]:
             return
         self.texture_report["choices"].add(key)
@@ -760,7 +819,7 @@ class CaptureScraper():
         if desc is not None:
             what = f"{desc.width}x{desc.height} {desc.format.Name()}"
         print(f"Texture choice for drawcall {drawcallId}: bound slot {position} of {count}, "
-              f"{what}, {size} bytes")
+              f"{what}, {size} bytes, written by {how}")
 
 def main(controller):
     scraper = CaptureScraper(controller)
