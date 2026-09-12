@@ -229,6 +229,21 @@ one applied:
   the placement is not in a matrix at all -- run `tools/mmi inspect --values
   --source` and report the vertex shader.
 
+**The geometry is right but every tile is black.** The material has an image,
+so a PNG was saved -- and it is black. The scraper used to save "the last
+texture bound to the fragment shader", which is fine while the shader binds
+exactly one; as soon as it binds a second (a placeholder, a lookup table, a
+depth texture) that is the one that got saved. It now ranks the bound
+textures by size and format, saves the best one, and checks the PNG is not a
+flat colour before accepting it (a real tile does not compress to a few
+hundred bytes; a black one does), moving on to the next candidate otherwise.
+Alpha is discarded on save: an unused, all-zero alpha channel used to make the
+whole texture transparent, which Blender shows as black. The import log
+reports the choice (`Texture choice for drawcall 0: bound slot N of M,
+256x256 R8G8B8A8_UNORM, 61234 bytes`) and a summary (`Textures: N saved, N
+blank, N draw calls without one`). If it still comes out black, run
+`tools/mmi inspect --textures` and report what the shader binds.
+
 **The browser opens but `tools/mmi status` never shows a graphics API.** The
 GPU process is not going through a path RenderDoc hooks. Try `--api gl-egl`,
 then `--api vulkan`, then `tools/mmi up --in-process-gpu`, which runs the GPU

@@ -106,6 +106,9 @@ def captureApi(state):
             return name
     return "unknown"
 
+# Below this a PNG is a flat colour, i.e. not a tile's texture.
+MIN_TEXTURE_BYTES = 2048
+
 def numpySave(array, file):
     np.array([array.ndim], dtype=np.int32).tofile(file)
     np.array(array.shape, dtype=np.int32).tofile(file)
@@ -122,6 +125,8 @@ class CaptureScraper():
         # that it knows which constant is the matrix and which the UV
         # transform when it cannot recognise them by name.
         self.uniform_hints = None
+        self._textures = None
+        self.texture_report = {"saved": 0, "missing": 0, "blank": 0, "choices": set()}
         # (events, draw calls, indexed draw calls) seen while scraping, used to
         # explain what went wrong when nothing relevant was found.
         self.capture_summary = None
@@ -624,6 +629,13 @@ class CaptureScraper():
 
             profiling_counters['processDrawEvent'].add_sample(timer)
 
+        report = self.texture_report
+        print(f"Textures: {report['saved']} saved, {report['blank']} blank, "
+              f"{report['missing']} draw calls without one")
+        if report["saved"] == 0 and max_drawcall > 0:
+            print("  No usable texture was found for any tile. Run `tools/mmi inspect")
+            print("  --textures` on this capture and report what the shader binds.")
+
         print("Profiling counters:")
         for key, counter in profiling_counters.items():
             print(f" - {key}: {counter.summary()}")
@@ -661,22 +673,94 @@ class CaptureScraper():
             )
         return message
 
+    def textureDescriptions(self):
+        """resourceId -> TextureDescription for every texture in the capture,
+        fetched once."""
+        if self._textures is None:
+            self._textures = {t.resourceId: t for t in self.controller.GetTextures()}
+        return self._textures
+
+    def candidateTextures(self, state):
+        """The textures the fragment shader can read, best candidate first.
+
+        The colour texture of a tile is a sizeable 2D image. Anything else the
+        shader reads -- a 1x1 placeholder, a lookup table, a depth texture --
+        is not, and taking "the last bound resource" (which is what used to
+        happen) picks one of those as soon as the shader binds more than one
+        texture, and the tile comes out black.
+        """
+        descriptions = self.textureDescriptions()
+        ranked = []
+        for position, rid in enumerate(rdcompat.getReadOnlyResources(state, rd.ShaderStage.Fragment)):
+            if rid is None or rid == rd.ResourceId.Null():
+                continue
+            desc = descriptions.get(rid)
+            if desc is None:
+                ranked.append((0, position, rid, None))
+                continue
+            if desc.creationFlags & rd.TextureCategory.DepthTarget and not (
+                desc.creationFlags & rd.TextureCategory.ShaderRead
+            ):
+                continue
+            if desc.type in (rd.TextureType.Buffer, rd.TextureType.Texture1D,
+                             rd.TextureType.Texture3D):
+                continue
+            ranked.append((desc.width * desc.height, position, rid, desc))
+        # Largest first; on a tie, the last bound one, as before.
+        ranked.sort(key=lambda entry: (entry[0], entry[1]), reverse=True)
+        return ranked
+
     def extractTexture(self, drawcallId, state):
-        """Save the texture in a png file (A bit dirty)"""
-        rid = rdcompat.getLastReadOnlyResource(state, rd.ShaderStage.Fragment)
-        if rid is None or rid == rd.ResourceId.Null():
+        """Save the tile's colour texture as a png."""
+        candidates = self.candidateTextures(state)
+        if not candidates:
             print(f"Warning: No texture found for drawcall {drawcallId}")
+            self.texture_report["missing"] += 1
             return
 
-        texsave = rd.TextureSave()
-        texsave.resourceId = rid
-        texsave.mip = 0
-        texsave.slice.sliceIndex = 0
-        texsave.alpha = rd.AlphaMapping.Preserve
-        texsave.destType = rd.FileType.PNG
-        timer = Timer()
-        self.controller.SaveTexture(texsave, "{}{:05d}-texture.png".format(FILEPREFIX, drawcallId))
-        profiling_counters["SaveTexture"].add_sample(timer)
+        path = "{}{:05d}-texture.png".format(FILEPREFIX, drawcallId)
+        for area, position, rid, desc in candidates:
+            texsave = rd.TextureSave()
+            texsave.resourceId = rid
+            texsave.mip = 0
+            texsave.slice.sliceIndex = 0
+            # The colour is all we want. Preserving alpha lets a texture whose
+            # alpha channel is unused (and zero) come out fully transparent,
+            # which reads as black in Blender.
+            texsave.alpha = rd.AlphaMapping.Discard
+            texsave.destType = rd.FileType.PNG
+            timer = Timer()
+            ok = self.controller.SaveTexture(texsave, path)
+            profiling_counters["SaveTexture"].add_sample(timer)
+
+            # A real satellite texture does not compress to a few hundred
+            # bytes; a uniform (black, transparent) one does. Try the next
+            # candidate rather than shipping a blank.
+            size = os.path.getsize(path) if os.path.isfile(path) else 0
+            threshold = MIN_TEXTURE_BYTES
+            if desc is not None:
+                # A tiny texture cannot be expected to weigh much.
+                threshold = min(MIN_TEXTURE_BYTES, 16 * desc.width * desc.height)
+            if ok and size >= threshold:
+                self.reportTexture(drawcallId, rid, desc, size, position, len(candidates))
+                return
+            print(f"  texture {rid} for drawcall {drawcallId} looks blank "
+                  f"({size} bytes{'' if ok else ', save failed'}), trying another")
+
+        self.texture_report["blank"] += 1
+        # Leave the last attempt in place rather than nothing at all.
+
+    def reportTexture(self, drawcallId, rid, desc, size, position, count):
+        self.texture_report["saved"] += 1
+        key = (position, count)
+        if key in self.texture_report["choices"]:
+            return
+        self.texture_report["choices"].add(key)
+        what = "unknown format"
+        if desc is not None:
+            what = f"{desc.width}x{desc.height} {desc.format.Name()}"
+        print(f"Texture choice for drawcall {drawcallId}: bound slot {position} of {count}, "
+              f"{what}, {size} bytes")
 
 def main(controller):
     scraper = CaptureScraper(controller)

@@ -127,6 +127,8 @@ def main(argv):
                         help="Print the vertex shader source of each detailed shader")
     parser.add_argument("--values", action="store_true",
                         help="Print the matrix and vec4 values for a few draw calls per shader")
+    parser.add_argument("--textures", action="store_true",
+                        help="List the textures the fragment shader binds, with size and format")
     args = parser.parse_args(argv)
 
     with CaptureWrapper(args.capture) as controller:
@@ -206,6 +208,17 @@ def main(argv):
                     print(f"  sample draw #{i}:")
                     for name in names:
                         print(f"    {name} = {fmt(row[name])}")
+
+            if args.textures and looks_right:
+                controller.SetFrameEvent(entry["draws"][0].eventId, False)
+                state = controller.GetPipelineState()
+                print("  fragment shader textures for the first draw call (best candidate first):")
+                for area, position, rid, desc in scraper.candidateTextures(state):
+                    if desc is None:
+                        print(f"    slot {position}: {rid} (no description)")
+                        continue
+                    print(f"    slot {position}: {desc.width}x{desc.height} {desc.format.Name()}"
+                          f" {desc.type} mips={desc.mips} array={desc.arraysize}")
 
             if args.source:
                 controller.SetFrameEvent(entry["draws"][0].eventId, False)

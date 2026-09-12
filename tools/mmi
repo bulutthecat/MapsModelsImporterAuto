@@ -1095,7 +1095,7 @@ cmd_inspect() {
         case "$1" in
             -h|--help) usage_inspect; return 0 ;;
             --top) extra+=("$1" "$2"); shift 2 ;;
-            --all-constants|--source|--values) extra+=("$1"); shift ;;
+            --all-constants|--source|--values|--textures) extra+=("$1"); shift ;;
             -*) extra+=("$1"); shift ;;
             *) if [ -z "$capture" ]; then capture="$1"; else extra+=("$1"); fi; shift ;;
         esac
@@ -1276,6 +1276,7 @@ it shows whether the 3D geometry is in there at all.
   --values                  Show matrix/vec4 values for a few draw calls, to see
                             which change per tile
   --source                  Print each shader's vertex shader source
+  --textures                List the textures the fragment shader binds
 EOF
 }
 
