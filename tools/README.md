@@ -68,6 +68,7 @@ Commands
 | `stop` | Ends the session |
 | `import FILE.rdc` | Imports one capture into a `.blend` with headless Blender |
 | `watch` | Imports every capture that appears in the capture directory |
+| `inspect FILE.rdc` | Reports what a capture contains, when an import finds nothing in it |
 | `install-chromium` | Downloads a self-contained Chrome into `MMI_HOME`, no root needed |
 | `install-chrome` | Installs Google Chrome from Google's apt repository |
 | `env` | Prints the resolved paths |
@@ -171,6 +172,28 @@ If you are launching the browser by hand, you need both of those flags.
 pid and refuses to start, because a second instance on the same profile would
 just hand its command line to the first one and exit. Close it, or use
 `tools/mmi up --replace`.
+
+**The import says "could not find any relevant draw call", but the capture is
+large and `inspect` shows thousands of indexed draw calls.** The geometry is
+there; it is the uniform *names* that no longer match. Chrome renders WebGL
+through ANGLE, which rewrites every uniform to `webgl_<16 hex digits>`, hashed
+from the original name. The two hashes hard-coded in `extractUniforms()` were
+taken from one version of the Google Maps shaders years ago, and every one of
+them changes whenever Google edits a shader.
+
+The importer therefore falls back on the shape of the draw calls: the tiles are
+drawn by whichever shader accounts for most of the indexed draw calls while
+holding a 4x4 matrix and a vec4 and taking a position and a UV attribute. It
+then picks between the candidate vec4s by trying each and keeping the one that
+maps the mesh's UVs into [0, 1]. The log says which constants it settled on:
+
+```
+Using 'webgl_a1b2c3d4e5f60718' as the model matrix and 'webgl_0f1e2d3c4b5a6978' (direct) as the UV transform
+```
+
+If the geometry imports but the textures look flipped vertically, that choice
+picked the wrong one of the two UV conventions; say so in an issue with the
+output of `tools/mmi inspect` and it can be pinned down.
 
 **The browser opens but `tools/mmi status` never shows a graphics API.** The
 GPU process is not going through a path RenderDoc hooks. Try `--api gl-egl`,

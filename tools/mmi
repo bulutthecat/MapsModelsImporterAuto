@@ -1055,6 +1055,29 @@ cmd_watch() {
 }
 
 # -----------------------------------------------------------------------------
+# inspect
+
+cmd_inspect() {
+    local capture="" extra=()
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -h|--help) usage_inspect; return 0 ;;
+            --top|--all-constants) extra+=("$1"); shift ;;
+            -*) extra+=("$1"); shift ;;
+            *) if [ -z "$capture" ]; then capture="$1"; else extra+=("$1"); fi; shift ;;
+        esac
+    done
+    [ -n "$capture" ] || die "Usage: $0 inspect CAPTURE.rdc"
+    [ -f "$capture" ] || die "No such file: $capture"
+
+    local python
+    python="$(require_python)"
+    PYTHONPATH="$RENDERDOC_MODULE_DIR${PYTHONPATH:+:$PYTHONPATH}" \
+    LD_LIBRARY_PATH="$RENDERDOC_MODULE_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+        "$python" "$SCRIPT_DIR/mmi_inspect.py" "$capture" ${extra+"${extra[@]}"}
+}
+
+# -----------------------------------------------------------------------------
 # misc
 
 cmd_env() {
@@ -1103,6 +1126,7 @@ Other commands:
   status               Show what the running session is hooked into
   stop                 Ask the running session to exit
   import FILE.rdc      Import one capture into a .blend (headless)
+  inspect FILE.rdc     Report what a capture contains, when an import finds nothing
   watch                Import every capture that shows up in the capture directory
   install-chromium     Download a self-contained Chrome into MMI_HOME (no root
                        needed, and the same build on every machine)
@@ -1206,6 +1230,19 @@ Usage: $0 import [options] CAPTURE.rdc
 EOF
 }
 
+usage_inspect() {
+    cat <<EOF
+Usage: $0 inspect [options] CAPTURE.rdc
+
+Groups the capture's draw calls by vertex shader and reports what each one
+declares. Use it when an import says it could not find any relevant draw call:
+it shows whether the 3D geometry is in there at all.
+
+  --top N                   Detail the N busiest shaders (default 5)
+  --all-constants           List every constant, not only matrices and vec4s
+EOF
+}
+
 usage_watch() {
     cat <<EOF
 Usage: $0 watch [--glb]
@@ -1232,6 +1269,7 @@ main() {
         status) cmd_status "$@" ;;
         stop) cmd_stop "$@" ;;
         import) cmd_import "$@" ;;
+        inspect) cmd_inspect "$@" ;;
         watch) cmd_watch "$@" ;;
         install-chromium) cmd_install_chromium "$@" ;;
         install-chrome) cmd_install_chrome "$@" ;;

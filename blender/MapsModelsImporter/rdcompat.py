@@ -74,17 +74,28 @@ def getConstantBlockSlot(constant_block, index):
     bind_point = getattr(constant_block, "bindPoint", None)
     return index if bind_point is None else bind_point
 
+def getReadOnlyResources(state, stage):
+    """Resource ids of the read-only resources (i.e. textures) bound to the
+    given shader stage, in binding order."""
+    if HAS_DESCRIPTOR_API:
+        return [used.descriptor.resource for used in state.GetReadOnlyResources(stage, True)]
+
+    resources = state.GetReadOnlyResources(stage)
+    ids = []
+    for entry in resources:
+        # Old-style BoundResourceArray.
+        if hasattr(entry, "resources"):
+            if entry.resources:
+                ids.append(entry.resources[0].resourceId)
+        else:
+            ids.append(entry.descriptor.resource)
+    return ids
+
 def getLastReadOnlyResource(state, stage):
     """Resource id of the last read-only resource (i.e. texture) bound to the
     given stage, or None. The Maps shaders bind the colour texture last, which
     is the heuristic this add-on has always relied on."""
-    if HAS_DESCRIPTOR_API:
-        used = state.GetReadOnlyResources(stage, True)
-        if not used:
-            return None
-        return used[-1].descriptor.resource
-
-    if HAS_BINDPOINT_MAPPING:
+    if HAS_BINDPOINT_MAPPING and not HAS_DESCRIPTOR_API:
         bindpoints = state.GetBindpointMapping(stage)
         if not bindpoints.samplers:
             return None
@@ -94,14 +105,8 @@ def getLastReadOnlyResource(state, stage):
             return None
         return resources[bind].resources[0].resourceId
 
-    resources = state.GetReadOnlyResources(stage)
-    if not resources:
-        return None
-    last = resources[-1]
-    # Old-style BoundResourceArray, just in case.
-    if hasattr(last, "resources"):
-        return last.resources[0].resourceId if last.resources else None
-    return last.descriptor.resource
+    ids = getReadOnlyResources(state, stage)
+    return ids[-1] if ids else None
 
 # -----------------------------------------------------------------------------
 

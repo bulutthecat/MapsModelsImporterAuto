@@ -32,6 +32,7 @@ Remember, you must use exactly the same version of python to load the RenderDoc 
 Find more information about building the RenderDoc Module here: https://github.com/baldurk/renderdoc/blob/v1.x/docs/CONTRIBUTING/Compiling.md\n"""
 
 import os
+import re
 import sys
 import pickle
 import numpy as np
@@ -74,6 +75,26 @@ CAPTURE_TYPE_UNIFORMS = {
     "Mapy CZ": ("_uMV", "_uParams"),
 }
 
+# ANGLE hashes the uniform names of WebGL shaders, which is why name matching
+# is hopeless for anything rendered by a browser.
+ANGLE_HASHED_NAME = re.compile(r"^_?webgl_[0-9a-f]{16}$")
+
+def isAngleWebglShader(names):
+    return any(ANGLE_HASHED_NAME.match(name) for name in names)
+
+def classifyConstants(constants):
+    """Split a shader's constants into 4x4 matrices and 4-component vectors,
+    the two things the importer needs."""
+    matrices = [name for name, rows, columns in constants if rows == 4 and columns == 4]
+    vectors = [name for name, rows, columns in constants if rows == 1 and columns == 4]
+    return matrices, vectors
+
+def hasPositionAndUV(attributes):
+    """Whether a vertex layout looks like textured geometry: something with at
+    least 3 components to be a position, and something with 2 to be a UV."""
+    counts = [count for _, count in attributes]
+    return len(counts) >= 2 and any(c >= 3 for c in counts) and any(c == 2 for c in counts)
+
 def numpySave(array, file):
     np.array([array.ndim], dtype=np.int32).tofile(file)
     np.array(array.shape, dtype=np.int32).tofile(file)
@@ -85,6 +106,11 @@ class CaptureScraper():
     def __init__(self, controller):
         self.controller = controller
         self._uniform_names_cache = {}
+        self._signature_cache = {}
+        # Names the structural strategy worked out, handed to the importer so
+        # that it knows which constant is the matrix and which the UV
+        # transform when it cannot recognise them by name.
+        self.uniform_hints = None
         # (events, draw calls, indexed draw calls) seen while scraping, used to
         # explain what went wrong when nothing relevant was found.
         self.capture_summary = None
@@ -156,6 +182,37 @@ class CaptureScraper():
             constants[cb.name] = block
         return constants
 
+    def getVertexShaderSignature(self, draw):
+        """What a draw call's vertex shader looks like, without reading any
+        buffer back: the shader's id, the constants it declares with their
+        dimensions, and the shape of its vertex inputs. Enough to recognise
+        the map geometry without knowing a single uniform name."""
+        cached = self._signature_cache.get(draw.eventId)
+        if cached is not None:
+            return cached
+
+        self.controller.SetFrameEvent(draw.eventId, False)
+        state = self.controller.GetPipelineState()
+        reflection = state.GetShaderReflection(rd.ShaderStage.Vertex)
+
+        constants = []
+        if reflection is not None:
+            for block in reflection.constantBlocks:
+                for var in block.variables:
+                    constants.append((var.name, var.type.rows, var.type.columns))
+
+        attributes = []
+        for attr in state.GetVertexInputs():
+            attributes.append((attr.name, attr.format.compCount))
+
+        signature = {
+            "shader": str(state.GetShader(rd.ShaderStage.Vertex)),
+            "constants": constants,
+            "attributes": attributes,
+        }
+        self._signature_cache[draw.eventId] = signature
+        return signature
+
     def getVertexUniformNames(self, draw):
         """Names of the constants declared by a draw call's vertex shader.
         Read from the reflection data only, so no buffer contents are fetched:
@@ -163,11 +220,7 @@ class CaptureScraper():
         cached = self._uniform_names_cache.get(draw.eventId)
         if cached is not None:
             return cached
-        self.controller.SetFrameEvent(draw.eventId, False)
-        state = self.controller.GetPipelineState()
-        names = rdcompat.constantBlockVariableNames(
-            state.GetShaderReflection(rd.ShaderStage.Vertex)
-        )
+        names = {name for name, _, _ in self.getVertexShaderSignature(draw)["constants"]}
         self._uniform_names_cache[draw.eventId] = names
         return names
 
@@ -330,9 +383,9 @@ class CaptureScraper():
                 per_type.setdefault(capture_type, []).append(draw)
 
         if not per_type:
-            print("Error: Could not find the beginning of the relevant 3D draw calls")
             self.capture_summary = (len(drawcalls), len(all_draws), len(candidates))
-            return [], "none"
+            print("No shader declares the uniform names we know about.")
+            return self.extractRelevantCallsByStructure(drawcalls)
 
         # If several services matched (they should not), go with the one that
         # accounts for the most geometry.
@@ -340,6 +393,65 @@ class CaptureScraper():
         relevant_drawcalls = per_type[capture_type]
         print(f"Found {len(relevant_drawcalls)} relevant draw calls.")
         return relevant_drawcalls, capture_type
+
+    def extractRelevantCallsByStructure(self, drawcalls):
+        """Last resort: recognise the map geometry by the shape of its draw
+        calls rather than by the names of its uniforms.
+
+        Chrome renders WebGL through ANGLE, and ANGLE rewrites every uniform
+        name to `webgl_<16 hex digits>`, hashed from the original. The hashes
+        in extractUniforms() were captured from one version of the Google Maps
+        shaders years ago; when Google edits a shader, every hash changes and
+        name matching stops working -- even though the capture is perfectly
+        good.
+
+        What does not change is the shape: the tiles are drawn by one shader,
+        used by far more draw calls than anything else on the page, taking a
+        position and a UV attribute, and holding a 4x4 matrix and at least one
+        vec4 in its constants.
+        """
+        print("Trying scraping strategy 'by structure' (name agnostic)...")
+
+        candidates = [draw for draw in drawcalls if rdcompat.isIndexedDrawcall(draw)]
+        if not candidates:
+            return [], "none"
+
+        groups = {}
+        for draw in candidates:
+            signature = self.getVertexShaderSignature(draw)
+            groups.setdefault(signature["shader"], []).append((draw, signature))
+
+        scored = []
+        for shader, entries in groups.items():
+            signature = entries[0][1]
+            matrices, vectors = classifyConstants(signature["constants"])
+            if not matrices or not vectors:
+                continue
+            if not hasPositionAndUV(signature["attributes"]):
+                continue
+            scored.append((len(entries), shader, entries, matrices, vectors, signature))
+
+        if not scored:
+            print("No shader looks like it draws textured 3D tiles.")
+            return [], "none"
+
+        # The tiles dominate the frame; anything else drawing through a matrix
+        # (the browser's own UI, an overlay) is a handful of calls.
+        scored.sort(key=lambda entry: entry[0], reverse=True)
+        count, shader, entries, matrices, vectors, signature = scored[0]
+
+        angle = isAngleWebglShader(name for name, _, _ in signature["constants"])
+        print(f"Picked shader {shader} used by {count} indexed draw calls.")
+        print(f"  matrix candidates: {matrices}")
+        print(f"  uv candidates: {vectors}")
+        if angle:
+            print("  (its uniform names are ANGLE hashes, as Chrome's WebGL produces)")
+
+        self.uniform_hints = {
+            "matrix_candidates": matrices,
+            "uv_candidates": vectors,
+        }
+        return [draw for draw, _ in entries], "Google Maps"
 
     def consolidateEvents(self, rootList, accumulator=None):
         if accumulator is None:
@@ -369,6 +481,19 @@ class CaptureScraper():
             )
 
         print(f"Scraping capture from {capture_type}...")
+
+        # Whichever strategy found the draw calls, work out which constants
+        # hold the matrix and the UV transform. The importer needs that
+        # whenever it cannot recognise them by name, which is the normal case
+        # for anything ANGLE translated.
+        if self.uniform_hints is None:
+            signature = self.getVertexShaderSignature(relevant_drawcalls[0])
+            matrices, vectors = classifyConstants(signature["constants"])
+            if matrices and vectors:
+                self.uniform_hints = {
+                    "matrix_candidates": matrices,
+                    "uv_candidates": vectors,
+                }
 
         if MAX_BLOCKS <= 0:
             max_drawcall = len(relevant_drawcalls)
@@ -413,7 +538,8 @@ class CaptureScraper():
             constants = self.getVertexShaderConstants(draw, state=state)
             constants["DrawCall"] = {
                 "topology": 'TRIANGLE_STRIP' if state.GetPrimitiveTopology() == rd.Topology.TriangleStrip else 'TRIANGLES',
-                "type": capture_type
+                "type": capture_type,
+                "uniform_hints": self.uniform_hints,
             }
             with open("{}{:05d}-constants.bin".format(FILEPREFIX, drawcallId), 'wb') as file:
                 pickle.dump(constants, file)
